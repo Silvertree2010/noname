@@ -321,6 +321,12 @@ impl App {
         self.toast(format!("model  {d}"));
     }
 
+    /// Ask claude which model and effort are really in force; the reply (`get-` id) corrects what is shown.
+    /// Asked only once a switch has been answered (`mdl-`/`eff-` reply): claude finishes those out of order, so an earlier ask can return the old values.
+    pub(crate) fn syncset(&mut self) {
+        self.ctrl("get", json!({"subtype": "get_settings"}));
+    }
+
     pub(crate) fn seteffort(&mut self, v: &str) {
         self.effs = v.to_string();
         if self.lv.is_some() {
@@ -1241,6 +1247,22 @@ impl App {
                     if let Some(i) = PM.iter().position(|x| *x == pm) {
                         self.mode = i;
                     }
+                    self.syncset();
+                } else if id.starts_with("mdl-") || id.starts_with("eff-") {
+                    self.syncset();
+                } else if id.starts_with("get-") {
+                    let ap = &p["applied"];
+                    let ef = sv(ap, "effort");
+                    if !ef.is_empty() {
+                        self.effs = ef;
+                    }
+                    let m = sv(ap, "model");
+                    if m.starts_with("claude-") {
+                        if let Some(i) = MID_ALL.iter().position(|x| m.starts_with(x.0)) {
+                            self.model = i;
+                        }
+                        self.mname = mnm(&m);
+                    }
                 } else if id.starts_with("rwf") {
                     let n = p["filesChanged"].as_array().map(|x| x.len()).or_else(|| p["files_changed"].as_array().map(|x| x.len()));
                     match n {
@@ -1340,6 +1362,7 @@ impl App {
             "result" => {
                 self.busy = false;
                 self.sb = None;
+                self.syncset();
                 let tb = self.lv.as_ref().map(|l| l.tb).unwrap_or(0);
                 let txt = sv(&e, "result");
                 let quiet = !self.bs.iter().skip(tb).any(|b| matches!(b, B::T(_) | B::Tl(_)));
