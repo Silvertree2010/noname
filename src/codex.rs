@@ -187,6 +187,7 @@ impl App {
         if let Some(c) = &mut a.cx {
             c.eng = Eng::Opencode;
         }
+        crate::opencode::load_cmds();
         if !a
             .cx
             .as_ref()
