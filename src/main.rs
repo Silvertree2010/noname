@@ -504,30 +504,43 @@ fn path_at(t: &[char], i: usize) -> Option<usize> {
     if !(t[i] == '/' || t[i] == '~' || t[i] == '.' || t[i].is_alphanumeric() || t[i] == '_') {
         return None;
     }
-    let mut j = i;
-    while j < t.len()
-        && !t[j].is_whitespace()
-        && !matches!(t[j], '<' | '>' | '"' | '`' | '│' | '…' | '|')
-    {
-        j += 1;
+    let word = |mut j: usize| {
+        while j < t.len()
+            && !t[j].is_whitespace()
+            && !matches!(t[j], '<' | '>' | '"' | '`' | '│' | '…' | '|')
+        {
+            j += 1;
+        }
+        j
+    };
+    let hit = |j: usize| {
+        let mut e = j;
+        while e > i
+            && matches!(
+                t[e - 1],
+                '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '*' | ')' | ']' | '}'
+            )
+        {
+            e -= 1;
+        }
+        let s: String = t[i..e].iter().collect();
+        let ok = s.chars().count() >= 2
+            && (s.contains('/') || s.contains('.') || s.starts_with('~'))
+            && s.chars().any(|c| c.is_alphanumeric());
+        (ok && noname::sys::exists(noname::sys::split_line(&s).0)).then_some(e)
+    };
+    // a path can hold spaces ("~/project The Researcher"): a path with a `/` tries up to
+    // 8 more words after single spaces and keeps the longest one that exists
+    let mut j = word(i);
+    let mut best = None;
+    for n in 0..=8 {
+        best = hit(j).or(best);
+        if n == 8 || t.get(j) != Some(&' ') || !t[i..j].contains(&'/') {
+            break;
+        }
+        j = word(j + 1);
     }
-    let mut e = j;
-    while e > i
-        && matches!(
-            t[e - 1],
-            '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '*' | ')' | ']' | '}'
-        )
-    {
-        e -= 1;
-    }
-    let s: String = t[i..e].iter().collect();
-    if s.chars().count() < 2
-        || !(s.contains('/') || s.contains('.') || s.starts_with('~'))
-        || !s.chars().any(|c| c.is_alphanumeric())
-    {
-        return None;
-    }
-    noname::sys::exists(noname::sys::split_line(&s).0).then_some(e)
+    best
 }
 
 /// The panel lines (menus and pickers above the input) cut to `h` rows. When they do not
@@ -2768,6 +2781,14 @@ mod tests {
         assert_eq!(u(&format!("at {f}:12:4,")), [format!("{f}:12:4")]);
         assert_eq!(u(&format!("({ds}/sub)")), [format!("{ds}/sub")]);
         assert_eq!(u(&format!("`{ds}/sub/`.")), [format!("{ds}/sub/")]);
+        // names with spaces: the longest part that exists, also when a shorter part does
+        std::fs::create_dir_all(d.join("my dir/Research - RAM 2026")).unwrap();
+        let sp = format!("{ds}/my dir/Research - RAM 2026");
+        assert_eq!(u(&format!("  {sp} and more")), std::slice::from_ref(&sp));
+        assert_eq!(
+            u(&format!("{ds}/sub and {ds}/sub")),
+            [format!("{ds}/sub"), format!("{ds}/sub")]
+        );
         // relative to the working folder (cargo test runs in the crate root)
         assert_eq!(
             u("edit src/main.rs and Cargo.toml"),

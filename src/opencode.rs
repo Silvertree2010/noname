@@ -27,6 +27,62 @@ pub(crate) fn cfg_model() -> String {
     "opencode".into()
 }
 
+static OC_CMDS: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(vec![]);
+
+/// Reads opencode's own commands and skills in the background (`opencode debug config` and
+/// `opencode debug skill`, about a second), so the / menu can list them once they are in.
+pub(crate) fn load_cmds() {
+    std::thread::spawn(|| {
+        let run = |w: &str| {
+            Command::new(crate::sys::bin("opencode"))
+                .args(["debug", w])
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default()
+        };
+        let v = parse_cmds(&run("config"), &run("skill"));
+        *OC_CMDS.lock().unwrap_or_else(|e| e.into_inner()) = v;
+    });
+}
+
+/// The commands and skills `load_cmds` found; empty before it is done or when it failed.
+pub(crate) fn cmds() -> Vec<(String, String)> {
+    OC_CMDS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// (name, description) from the `command` map of the resolved config and the skill list;
+/// a command wins over a skill of the same name. Text before the JSON is skipped.
+fn parse_cmds(config: &str, skills: &str) -> Vec<(String, String)> {
+    let json = |t: &str, open: char| {
+        t.find(open).and_then(|i| {
+            serde_json::Deserializer::from_str(&t[i..])
+                .into_iter::<Value>()
+                .next()?
+                .ok()
+        })
+    };
+    let mut v: Vec<(String, String)> = json(config, '{')
+        .and_then(|c| c.get("command")?.as_object().cloned())
+        .into_iter()
+        .flatten()
+        .map(|(n, c)| (n, one(&sv(&c, "description"), 80)))
+        .collect();
+    for s in json(skills, '[')
+        .as_ref()
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let n = sv(s, "name");
+        if !n.is_empty() && !v.iter().any(|x| x.0 == n) {
+            v.push((n, one(&sv(s, "description"), 80)));
+        }
+    }
+    v
+}
+
 /// `/name args` -> (`name`, `args`), for running an opencode command or skill with `--command`.
 pub(crate) fn split_cmd(x: &str) -> Option<(&str, &str)> {
     let r = x.strip_prefix('/')?;
@@ -281,6 +337,22 @@ impl App {
 mod tests {
     use super::*;
     use crate::codex::Eng;
+
+    #[test]
+    fn reads_commands_and_skills() {
+        let cfg = r#"note
+{"model":"x","command":{"nemotron":{"description":"Run on Nemotron","template":"$ARGUMENTS"},"dots":{}}}"#;
+        let sk = r#"[{"name":"deep-research","description":"Deep research.\nmore"},{"name":"nemotron","description":"dup"}]"#;
+        assert_eq!(
+            parse_cmds(cfg, sk),
+            [
+                ("dots".to_string(), String::new()),
+                ("nemotron".into(), "Run on Nemotron".into()),
+                ("deep-research".into(), "Deep research.".into()),
+            ]
+        );
+        assert!(parse_cmds("", "error").is_empty());
+    }
 
     #[test]
     fn splits_slash_commands() {
