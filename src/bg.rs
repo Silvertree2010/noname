@@ -268,6 +268,13 @@ impl Bg {
         {
             return Err(io::Error::last_os_error());
         }
+        // openpty does not set close-on-exec, so without this every later child (claude, its
+        // tool shells, openers) would inherit both ends of this pty and keep them open
+        // SAFETY: fcntl on two descriptors openpty just returned; it only sets a flag.
+        unsafe {
+            libc::fcntl(m, libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(s, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
         // SAFETY: openpty succeeded, so `m` and `s` are open descriptors that nothing else owns;
         // each OwnedFd takes over exactly one of them and closes it once.
         let m = unsafe { OwnedFd::from_raw_fd(m) };
