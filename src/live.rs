@@ -150,6 +150,10 @@ fn reap(c: &mut Child) {
     if let Ok(mut k) = KIDS.lock() {
         k.retain(|x| *x != c.id() as i32);
     }
+    // already waited for: its pid may belong to another process by now, so send nothing
+    if matches!(c.try_wait(), Ok(Some(_))) {
+        return;
+    }
     crate::sys::term(c.id() as i32);
     for _ in 0..20 {
         if matches!(c.try_wait(), Ok(Some(_))) {
