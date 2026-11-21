@@ -4680,8 +4680,10 @@ fn ttl(a: &App) -> String {
 }
 
 fn editor(s: &str) -> Option<String> {
-    let f = std::env::temp_dir().join(format!("noname-prompt-{}.md", std::process::id()));
-    std::fs::write(&f, s).ok()?;
+    let f = sys::tmp_write(
+        &format!("noname-prompt-{}.md", std::process::id()),
+        s.as_bytes(),
+    )?;
     let ed = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| {

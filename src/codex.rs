@@ -291,12 +291,12 @@ impl App {
             }
             cmd.args(&c.args);
             for (k, (m, b)) in imgs.iter().enumerate() {
-                let f = std::env::temp_dir().join(format!(
+                let n = format!(
                     "noname-{}-{t}-{k}.{}",
                     std::process::id(),
                     crate::img::ext(m)
-                ));
-                if std::fs::write(&f, b).is_ok() {
+                );
+                if let Some(f) = crate::sys::tmp_write(&n, b) {
                     cmd.arg("-i").arg(f);
                 }
             }

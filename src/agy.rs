@@ -64,12 +64,12 @@ pub(crate) fn build(
     // print mode takes text only: an image goes in as a file path the agent can open
     let mut p = x.to_string();
     for (k, (m, b)) in imgs.iter().enumerate() {
-        let f = std::env::temp_dir().join(format!(
+        let n = format!(
             "noname-{}-{t}-{k}.{}",
             std::process::id(),
             crate::img::ext(m)
-        ));
-        if std::fs::write(&f, b).is_ok() {
+        );
+        if let Some(f) = crate::sys::tmp_write(&n, b) {
             p.push_str(&format!("\n\n(attached image: {})", f.display()));
         }
     }
