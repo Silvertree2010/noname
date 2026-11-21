@@ -374,7 +374,7 @@ pub fn open(path: &str, line: &str) {
         use std::os::unix::process::CommandExt;
         c.process_group(0);
     }
-    let _ = c.spawn();
+    detach(&mut c);
 }
 
 /// The `NONAME_OPEN` command for `path` at `line` as program + arguments. The template is
@@ -422,7 +422,7 @@ pub fn open_url(url: &str) {
         use std::os::unix::process::CommandExt;
         c.process_group(0);
     }
-    let _ = c.spawn();
+    detach(&mut c);
 }
 
 /// `path:line` or `path:line:col` → (path, line); a path with no number gives "".
@@ -507,7 +507,17 @@ pub fn open_dir(path: &str) {
         use std::os::unix::process::CommandExt;
         c.process_group(0);
     }
-    let _ = c.spawn();
+    detach(&mut c);
+}
+
+/// Starts an opener and waits for it on a thread, so a finished opener (xdg-open exits once
+/// the app is up) is reaped instead of staying a zombie for as long as noname runs.
+fn detach(c: &mut Command) {
+    if let Ok(mut ch) = c.spawn() {
+        std::thread::spawn(move || {
+            let _ = ch.wait();
+        });
+    }
 }
 
 /// The current local month, counted from 0 (January) to 11 (December).
