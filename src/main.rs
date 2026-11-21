@@ -359,7 +359,7 @@ fn links(bl: &[Line], a: usize, b: usize, w: usize) -> Vec<(usize, u16, u16, Str
         // than the line it belongs to (or as far as the wrapped part before it)
         let (gk, ek) = gutter(&cur);
         let wrapped = |w: bool, g: &str, e: usize, gn: &str, en: usize| {
-            !g.is_empty() && g == gn && (en == e + 2 || (w && en == e))
+            !g.is_empty() && g == gn && (e.checked_add(2) == Some(en) || (w && en == e))
         };
         let wk = pg
             .take()
@@ -2751,6 +2751,9 @@ mod tests {
         let bl = noname::md("```\nhttps://a.example/xx\nyyyy\n```", 24, &mdt());
         let l = links(&bl, 0, bl.len(), 24);
         assert!(l.iter().all(|x| x.3 == "https://a.example/xx"), "{l:?}");
+        // a blank code line (gutter only) before another code line must not overflow
+        let bl = noname::md("```\nfn a() {}\n\nfn b() {}\n```", 40, &mdt());
+        links(&bl, 0, bl.len(), 40);
     }
 
     #[test]
