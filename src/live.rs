@@ -230,6 +230,21 @@ fn spawn(args: &[String]) -> io::Result<(Child, ChildStdin, Receiver<Value>)> {
     Ok((c, i, rx))
 }
 
+/// `args` with any `--model` dropped and `--model v` added at the end.
+fn with_model(args: &[String], v: &str) -> Vec<String> {
+    let mut o = vec![];
+    let mut it = args.iter();
+    while let Some(x) = it.next() {
+        if x == "--model" {
+            it.next();
+        } else if !x.starts_with("--model=") {
+            o.push(x.clone());
+        }
+    }
+    o.extend(["--model".into(), v.into()]);
+    o
+}
+
 fn mnm(id: &str) -> String {
     let s = id.trim_start_matches("claude-");
     let s = s.split('[').next().unwrap_or(s);
@@ -387,7 +402,9 @@ impl App {
             self.model = i;
         }
         self.mname = d.to_lowercase().replace(' ', "-");
-        if self.lv.is_some() {
+        if let Some(l) = &mut self.lv {
+            // /clear and resume restart claude with these args, so they must carry the new model
+            l.args = with_model(&l.args, v);
             self.ctrl("mdl", json!({"subtype": "set_model", "model": v}));
         }
         self.toast(format!("model  {d}"));
@@ -2566,5 +2583,18 @@ mod model_tests {
         assert_eq!(a.mname, "opus-5.5");
         a.setmodel("claude-haiku-5-5");
         assert_eq!(a.mname, "haiku-5.5");
+    }
+
+    #[test]
+    fn with_model_replaces_the_model_flag() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            with_model(&s(&["-c"]), "opus"),
+            s(&["-c", "--model", "opus"])
+        );
+        assert_eq!(
+            with_model(&s(&["--model", "haiku", "-c", "--model=sonnet"]), "opus"),
+            s(&["-c", "--model", "opus"])
+        );
     }
 }
