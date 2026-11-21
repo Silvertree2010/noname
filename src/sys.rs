@@ -4,6 +4,21 @@
 use std::path::PathBuf;
 use std::process::{Child, Command};
 
+/// Writes `b` to a new file `name` in the temp folder that only this user can read (the
+/// shared /tmp would make it 0644). A file of that name that is in the way is removed first;
+/// when that fails (someone else's file or link), nothing is written.
+pub fn tmp_write(name: &str, b: &[u8]) -> Option<PathBuf> {
+    use std::io::Write;
+    let f = std::env::temp_dir().join(name);
+    let _ = std::fs::remove_file(&f);
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    o.open(&f).and_then(|mut x| x.write_all(b)).ok()?;
+    Some(f)
+}
+
 /// The home folder from `HOME` or `USERPROFILE`, or an empty string when neither is set.
 pub fn home() -> String {
     std::env::var("HOME")
@@ -836,6 +851,21 @@ pub fn opacity_back() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temp_files_are_private_and_fresh() {
+        let n = format!("noname-tmptest-{}", std::process::id());
+        let f = tmp_write(&n, b"old").unwrap();
+        let f2 = tmp_write(&n, b"new").unwrap();
+        assert_eq!(std::fs::read(&f2).unwrap(), b"new");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let m = std::fs::metadata(&f).unwrap().permissions().mode();
+            assert_eq!(m & 0o777, 0o600);
+        }
+        let _ = std::fs::remove_file(f);
+    }
 
     #[test]
     fn panic_report_is_appended_not_overwritten() {
