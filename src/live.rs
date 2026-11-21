@@ -2115,20 +2115,15 @@ impl App {
                 }
                 let tot = e["total_cost_usd"].as_f64().unwrap_or(0.0);
                 let u = &e["usage"];
-                let tok = [
-                    "input_tokens",
-                    "cache_creation_input_tokens",
-                    "cache_read_input_tokens",
-                    "output_tokens",
-                ]
-                .iter()
-                .map(|k| u[*k].as_u64().unwrap_or(0))
-                .sum::<u64>();
+                // cache reads repeat the whole context on every call, so they are shown apart
+                let n = |k: &str| u[k].as_u64().unwrap_or(0);
+                let cached = n("cache_read_input_tokens");
+                let tok = n("input_tokens") + n("cache_creation_input_tokens") + n("output_tokens");
                 let secs = e["duration_ms"].as_f64().unwrap_or(0.0) as f32 / 1000.0;
                 let (c0, w0) = self.lv.as_ref().map(|l| (l.c0, l.w0)).unwrap_or((0.0, 0.0));
                 let dw = if w0 >= 0.0 { self.d7 - w0 } else { 0.0 };
-                if tok > 0 {
-                    let mut r = rcfmt(secs, tok, (tot - c0).max(0.0), dw);
+                if tok + cached > 0 {
+                    let mut r = rcfmt(secs, tok, cached, (tot - c0).max(0.0), dw);
                     let ne = self.tedits();
                     if ne > 0 {
                         r += &format!("  ·  {ne} edit{}", if ne == 1 { "" } else { "s" });

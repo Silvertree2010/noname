@@ -853,7 +853,7 @@ fn hist0() -> Vec<B> {
         B::Tl(Tool { t1: 12, ..tl(Tk::Edit, "src/feed.rs", "+3 -2", edit1()) }),
         B::Tl(Tool { t1: 254, ..tl(Tk::Bash, "cargo build --release", "ok", vec![p("   Compiling rusttok v0.4.1 (/home/you/projects/rusttok)"), p("    Finished `release` profile [optimized] target(s) in 8.42s")]) }),
         B::T("Done. Scrolling is now framerate independent and eases out instead of stopping hard. Try it with `cargo run --release`.".into()),
-        B::Rc(rcfmt(12.4, 18_200, 0.08, 0.0), 0),
+        B::Rc(rcfmt(12.4, 18_200, 0, 0.08, 0.0), 0),
     ]
 }
 
@@ -885,7 +885,7 @@ fn script(n: usize) -> Vec<Sp> {
             Sp::Tl(tl(Tk::Bash, "cargo test", "24 passed", vec![p("running 24 tests"), p("test feed::smooth ... ok"), p("test swipe::snap_back ... ok"), p("test result: ok. 24 passed; 0 failed; finished in 0.31s")]), 70),
             Sp::Todo(vec![(2, "feed.rs to delta time".into()), (2, "check build".into()), (2, "easing for swipe snap".into())]),
             Sp::Tx("Done. The snap now eases out with the same curve as scrolling, and all 24 tests pass.".into()),
-            Sp::Rc(rcfmt(19.6, 31_500, 0.14, 1.0)),
+            Sp::Rc(rcfmt(19.6, 31_500, 0, 0.14, 1.0)),
         ],
         1 => vec![
             Sp::Th("Committing both files, asking before the push since it leaves this machine.".into()),
@@ -897,7 +897,7 @@ fn script(n: usize) -> Vec<Sp> {
             Sp::Tl(tl(Tk::Task, "explore: where is the feed rendered", "4 files", vec![p("read src/ui.rs"), p("read src/feed.rs"), p("grep \"render_card\"  ->  2 matches"), p("read src/card.rs"), p("result: render in ui.rs:120, rows are whole cells")]), 60),
             Sp::Tl(tl(Tk::Web, "ratatui smooth scrolling sub-cell", "5 results", vec![p("ratatui.rs  ·  Rendering with half blocks"), p("github.com  ·  tachyonfx motion effects"), p("blog  ·  frame pacing in terminal apps")]), 30),
             Sp::Tx("Three ways to make scrolling even smoother:\n\n- **Sub-row rendering** with half blocks, twice as fine steps\n- **Prediction** of the next frame from swipe velocity\n- **Frame pacing** tied to the monitor refresh rate\n\nI would start with the first one, it makes the biggest visible difference.".into()),
-            Sp::Rc(rcfmt(9.2, 22_700, 0.09, 0.0)),
+            Sp::Rc(rcfmt(9.2, 22_700, 0, 0.09, 0.0)),
         ],
     }
 }
@@ -1232,12 +1232,12 @@ impl App {
             a.ans = Some(c);
         }
         if c == 'n' {
-            self.q.push_front(Sp::Rc(rcfmt(4.1, 9_800, 0.03, 0.0)));
+            self.q.push_front(Sp::Rc(rcfmt(4.1, 9_800, 0, 0.03, 0.0)));
             self.q.push_front(Sp::Tx(
                 "Okay, not pushed. The commit stays local on `main`.".into(),
             ));
         } else {
-            self.q.push_front(Sp::Rc(rcfmt(6.8, 12_400, 0.04, 0.0)));
+            self.q.push_front(Sp::Rc(rcfmt(6.8, 12_400, 0, 0.04, 0.0)));
             self.q.push_front(Sp::Tx("Pushed to `origin/main`.".into()));
             self.q.push_front(Sp::Tl(
                 tl(
@@ -5073,14 +5073,13 @@ fn dump<T: V + Clone>(v0: &mut T, args: &[String]) -> io::Result<()> {
 
 const NZ: &[u8] = b"0123456789abcdefABCDEF$%@#";
 
-/// Formats the end-of-turn recap, such as `12.4s  ·  18.2k tok  ·  $0.08`, with the weekly-limit share added when `dw` is at least 0.5.
-pub fn rcfmt(secs: f32, tok: u64, usd: f64, dw: f32) -> String {
-    let t = if tok >= 1000 {
-        format!("{:.1}k", tok as f64 / 1000.0)
-    } else {
-        tok.to_string()
-    };
-    let mut s = format!("{secs:.1}s  ·  {t} tok  ·  ${usd:.2}");
+/// Formats the end-of-turn recap, such as `12.4s  ·  18.2k new  ·  2.59M cached  ·  $0.08`: `new` = input + cache-creation + output, `cached` = cache reads (left out at 0); the weekly-limit share is added when `dw` is at least 0.5.
+pub fn rcfmt(secs: f32, new: u64, cached: u64, usd: f64, dw: f32) -> String {
+    let mut s = format!("{secs:.1}s  ·  {} new", free::short(new));
+    if cached > 0 {
+        s += &format!("  ·  {} cached", free::short(cached));
+    }
+    s += &format!("  ·  ${usd:.2}");
     if dw >= 0.5 {
         s += &format!("  ·  +{dw:.0}% week");
     }
@@ -5173,6 +5172,18 @@ pub fn decode(
 #[cfg(test)]
 mod key_tests {
     use super::*;
+
+    #[test]
+    fn recap_splits_cached() {
+        assert_eq!(
+            rcfmt(188.4, 14_200, 2_595_400, 0.86, 0.0),
+            "188.4s  ·  14.2k new  ·  2.60M cached  ·  $0.86"
+        );
+        assert_eq!(
+            rcfmt(1.0, 950, 0, 0.01, 2.0),
+            "1.0s  ·  950 new  ·  $0.01  ·  +2% week"
+        );
+    }
 
     fn ev(c: char, m: Km) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), m)
