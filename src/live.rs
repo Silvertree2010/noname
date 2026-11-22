@@ -1,6 +1,6 @@
 //! The default engine: a long-lived `claude` process spoken to over stream-json on stdin and stdout.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
@@ -19,6 +19,7 @@ pub(crate) struct Lv {
     sm: HashMap<String, String>,
     bm: HashMap<u64, usize>,
     areq: Option<(String, Value, Value)>,
+    pq: VecDeque<Value>,
     sid: String,
     args: Vec<String>,
     brx: Option<Receiver<Value>>,
@@ -786,6 +787,7 @@ impl App {
             sm: HashMap::new(),
             bm: HashMap::new(),
             areq: None,
+            pq: VecDeque::new(),
             sid: String::new(),
             args,
             brx: None,
@@ -1250,6 +1252,7 @@ impl App {
 
     pub(crate) fn lstop(&mut self) {
         self.ctrl("int", json!({"subtype": "interrupt"}));
+        self.ldeny("The user interrupted.");
         if self.ask.is_some() {
             self.lanswer('n');
         }
@@ -1290,6 +1293,7 @@ impl App {
                 _ => json!({"behavior": "deny", "message": "The user wants to keep planning."}),
             };
             self.send(json!({"type": "control_response", "response": {"subtype": "success", "request_id": q.id, "response": r}}));
+            self.lnext();
             return;
         }
         let r = if ok {
@@ -1302,6 +1306,7 @@ impl App {
             json!({"behavior": "deny", "message": "The user dismissed the question."})
         };
         self.send(json!({"type": "control_response", "response": {"subtype": "success", "request_id": q.id, "response": r}}));
+        self.lnext();
     }
 
     pub(crate) fn lanswer(&mut self, c: char) {
@@ -1318,6 +1323,7 @@ impl App {
             _ => json!({"behavior": "allow", "updatedInput": inp}),
         };
         self.send(json!({"type": "control_response", "response": {"subtype": "success", "request_id": id, "response": r}}));
+        self.lnext();
     }
 
     pub(crate) fn pump(&mut self) {
@@ -1336,6 +1342,147 @@ impl App {
             self.bev(e);
         }
         self.cmpoll();
+    }
+
+    fn creq(&mut self, e: &Value) {
+        let r = &e["request"];
+        if sv(r, "tool_name") == "AskUserQuestion" {
+            let qs: Vec<Qq> = r["input"]["questions"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|x| Qq {
+                    q: sv(x, "question"),
+                    h: sv(x, "header"),
+                    opts: x["options"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|o| (sv(o, "label"), sv(o, "description")))
+                        .collect(),
+                    multi: x["multiSelect"] == true,
+                })
+                .collect();
+            let id = sv(e, "request_id");
+            if qs.is_empty() {
+                self.send(json!({"type": "control_response", "response": {"subtype": "success", "request_id": id, "response": {"behavior": "allow", "updatedInput": r["input"].clone()}}}));
+            } else {
+                let n = qs[0].opts.len();
+                self.qa = Some(Qa {
+                    id,
+                    inp: r["input"].clone(),
+                    qs,
+                    i: 0,
+                    sel: 0,
+                    pick: vec![false; n],
+                    ans: vec![],
+                    plan: false,
+                });
+            }
+        } else if sv(r, "tool_name") == "ExitPlanMode" {
+            let plan = sv(&r["input"], "plan");
+            if !plan.trim().is_empty() {
+                self.bs.push(B::T(plan.trim().to_string()));
+            }
+            let opts = vec![
+                (
+                    "yes, auto mode".to_string(),
+                    "Claude works on its own, the classifier checks risky steps".to_string(),
+                ),
+                (
+                    "yes, approve edits".to_string(),
+                    "you approve each edit and command".to_string(),
+                ),
+                (
+                    "yes, bypass permissions".to_string(),
+                    "no questions at all".to_string(),
+                ),
+                ("no, keep planning".to_string(), String::new()),
+            ];
+            let id = sv(e, "request_id");
+            self.qa = Some(Qa {
+                id,
+                inp: r["input"].clone(),
+                qs: vec![Qq {
+                    q: "Ready to code?".into(),
+                    h: "plan".into(),
+                    opts,
+                    multi: false,
+                }],
+                i: 0,
+                sel: 0,
+                pick: vec![false; 4],
+                ans: vec![],
+                plan: true,
+            });
+        } else {
+            let name = sv(r, "tool_name");
+            let t = mk(&name, &r["input"]);
+            let cmd = if t.a.is_empty() {
+                t.nm.clone()
+            } else {
+                format!("{}  {}", t.nm, t.a)
+            };
+            self.bs.push(B::Ask(Ask { cmd, ans: None }));
+            self.ask = Some(self.bs.len() - 1);
+            if let Some(l) = &mut self.lv {
+                l.areq = Some((
+                    sv(e, "request_id"),
+                    r["input"].clone(),
+                    r.get("permission_suggestions")
+                        .cloned()
+                        .unwrap_or(json!([])),
+                ));
+            }
+        }
+    }
+
+    fn lnext(&mut self) {
+        while self.ask.is_none() && self.qa.is_none() {
+            let Some(e) = self.lv.as_mut().and_then(|l| l.pq.pop_front()) else {
+                return;
+            };
+            self.creq(&e);
+        }
+    }
+
+    fn lcancel(&mut self, id: &str) {
+        if let Some(l) = &mut self.lv {
+            l.pq.retain(|x| sv(x, "request_id") != id);
+        }
+        if self
+            .lv
+            .as_ref()
+            .and_then(|l| l.areq.as_ref())
+            .is_some_and(|a| a.0 == id)
+        {
+            if let Some(l) = &mut self.lv {
+                l.areq = None;
+            }
+            if let Some(i) = self.ask.take() {
+                if let Some(B::Ask(a)) = self.bs.get_mut(i) {
+                    a.ans = Some('n');
+                }
+            }
+        }
+        if self.qa.as_ref().is_some_and(|q| q.id == id) {
+            self.qa = None;
+            self.bs.push(B::Sys("question withdrawn".into()));
+        }
+        self.lnext();
+    }
+
+    fn ldeny(&mut self, why: &str) {
+        let ids: Vec<String> = self
+            .lv
+            .as_mut()
+            .map(|l| l.pq.drain(..).map(|x| sv(&x, "request_id")).collect())
+            .unwrap_or_default();
+        for id in ids {
+            self.send(json!({"type": "control_response", "response": {"subtype": "success", "request_id": id, "response": {"behavior": "deny", "message": why}}}));
+        }
     }
 
     fn mres(&mut self, rid: &str, m: Value) {
@@ -1845,103 +1992,20 @@ impl App {
                 let r = &e["request"];
                 if r["subtype"] == "mcp_message" {
                     self.mcp(&e);
-                } else if r["subtype"] == "can_use_tool" && sv(r, "tool_name") == "AskUserQuestion"
-                {
-                    let qs: Vec<Qq> = r["input"]["questions"]
-                        .as_array()
-                        .cloned()
-                        .unwrap_or_default()
-                        .iter()
-                        .map(|x| Qq {
-                            q: sv(x, "question"),
-                            h: sv(x, "header"),
-                            opts: x["options"]
-                                .as_array()
-                                .cloned()
-                                .unwrap_or_default()
-                                .iter()
-                                .map(|o| (sv(o, "label"), sv(o, "description")))
-                                .collect(),
-                            multi: x["multiSelect"] == true,
-                        })
-                        .collect();
-                    let id = sv(&e, "request_id");
-                    if qs.is_empty() {
-                        self.send(json!({"type": "control_response", "response": {"subtype": "success", "request_id": id, "response": {"behavior": "allow", "updatedInput": r["input"].clone()}}}));
-                    } else {
-                        let n = qs[0].opts.len();
-                        self.qa = Some(Qa {
-                            id,
-                            inp: r["input"].clone(),
-                            qs,
-                            i: 0,
-                            sel: 0,
-                            pick: vec![false; n],
-                            ans: vec![],
-                            plan: false,
-                        });
-                    }
-                } else if r["subtype"] == "can_use_tool" && sv(r, "tool_name") == "ExitPlanMode" {
-                    let plan = sv(&r["input"], "plan");
-                    if !plan.trim().is_empty() {
-                        self.bs.push(B::T(plan.trim().to_string()));
-                    }
-                    let opts = vec![
-                        (
-                            "yes, auto mode".to_string(),
-                            "Claude works on its own, the classifier checks risky steps"
-                                .to_string(),
-                        ),
-                        (
-                            "yes, approve edits".to_string(),
-                            "you approve each edit and command".to_string(),
-                        ),
-                        (
-                            "yes, bypass permissions".to_string(),
-                            "no questions at all".to_string(),
-                        ),
-                        ("no, keep planning".to_string(), String::new()),
-                    ];
-                    let id = sv(&e, "request_id");
-                    self.qa = Some(Qa {
-                        id,
-                        inp: r["input"].clone(),
-                        qs: vec![Qq {
-                            q: "Ready to code?".into(),
-                            h: "plan".into(),
-                            opts,
-                            multi: false,
-                        }],
-                        i: 0,
-                        sel: 0,
-                        pick: vec![false; 4],
-                        ans: vec![],
-                        plan: true,
-                    });
                 } else if r["subtype"] == "can_use_tool" {
-                    let name = sv(r, "tool_name");
-                    let t = mk(&name, &r["input"]);
-                    let cmd = if t.a.is_empty() {
-                        t.nm.clone()
+                    if self.ask.is_some() || self.qa.is_some() {
+                        if let Some(l) = &mut self.lv {
+                            l.pq.push_back(e.clone());
+                        }
                     } else {
-                        format!("{}  {}", t.nm, t.a)
-                    };
-                    self.bs.push(B::Ask(Ask { cmd, ans: None }));
-                    self.ask = Some(self.bs.len() - 1);
-                    if let Some(l) = &mut self.lv {
-                        l.areq = Some((
-                            sv(&e, "request_id"),
-                            r["input"].clone(),
-                            r.get("permission_suggestions")
-                                .cloned()
-                                .unwrap_or(json!([])),
-                        ));
+                        self.creq(&e);
                     }
                 } else {
                     let id = sv(&e, "request_id");
                     self.send(json!({"type": "control_response", "response": {"subtype": "error", "request_id": id, "error": "unsupported"}}));
                 }
             }
+            "control_cancel_request" => self.lcancel(&sv(&e, "request_id")),
             "control_response" => {
                 let r = &e["response"];
                 let id = sv(r, "request_id");
@@ -2404,6 +2468,7 @@ impl App {
             sm: HashMap::new(),
             bm: HashMap::new(),
             areq: None,
+            pq: VecDeque::new(),
             sid: if par.is_empty() { String::new() } else { sid },
             args: base,
             brx: None,
@@ -2418,6 +2483,7 @@ impl App {
         });
         self.bs.truncate(i);
         self.ask = None;
+        self.qa = None;
         self.sb = None;
         self.busy = false;
         self.inp = txt;
