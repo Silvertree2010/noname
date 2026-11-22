@@ -12,6 +12,11 @@ categories = ["command-line-utilities"]
 rust-version = "1.85"
 exclude = ["assets/*", "packaging/*", ".github/*"]
 
+[features]
+default = ["voice"]
+# `/voice` dictation (whisper.cpp, downloaded on first use); build with --no-default-features to leave it out
+voice = ["windows-sys/Win32_Media_Multimedia"]
+
 [lints.rust]
 missing_docs = "warn"
 unreachable_pub = "warn"

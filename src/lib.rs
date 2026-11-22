@@ -13,6 +13,8 @@ mod live;
 mod opencode;
 pub mod sys;
 pub mod upd;
+#[cfg(feature = "voice")]
+mod voice;
 
 /// One entry of the model list: value, display name, description and effort levels.
 pub type ModelEntry = (String, String, String, Vec<String>);
@@ -635,6 +637,12 @@ pub struct App {
     pub qa: Option<Qa>,
     /// Receiver for the result of the running update check, if one is running.
     pub upr: Option<std::sync::mpsc::Receiver<upd::Up>>,
+    /// `/voice` microphone recording, while one runs.
+    #[cfg(feature = "voice")]
+    vrec: Option<voice::Rec>,
+    /// `/voice` download or transcription running in the background.
+    #[cfg(feature = "voice")]
+    vjob: Option<voice::VJob>,
     /// Update status text shown in the settings menu.
     pub ups: String,
     /// Whether the running update check was started by the user, so the result is shown as a toast.
@@ -982,6 +990,10 @@ impl App {
             ns: None,
             qa: None,
             upr: None,
+            #[cfg(feature = "voice")]
+            vrec: None,
+            #[cfg(feature = "voice")]
+            vjob: None,
             ups: String::new(),
             upf: false,
             frr: None,
@@ -1084,6 +1096,8 @@ impl App {
         }
         self.frpoll();
         self.clpoll();
+        #[cfg(feature = "voice")]
+        self.vpoll();
         if let Some(r) = &self.upr {
             if let Ok(u) = r.try_recv() {
                 self.upr = None;
@@ -1696,6 +1710,11 @@ impl App {
             } else {
                 self.toast(format!("unknown background  {a0}"));
             }
+            return;
+        }
+        #[cfg(feature = "voice")]
+        if c0 == "voice" {
+            self.voice(a0.trim());
             return;
         }
         if c0 == "copy" {
@@ -2392,6 +2411,11 @@ impl App {
 
     /// Handles one key press, and records an undo step when the input text changes.
     pub fn key(&mut self, k: KeyEvent) {
+        #[cfg(feature = "voice")]
+        if self.vrec.is_some() && matches!(k.code, KeyCode::Enter | KeyCode::Esc) {
+            self.vstop(k.code == KeyCode::Enter);
+            return;
+        }
         let b = (self.inp.clone(), self.cur);
         let typ = matches!(k.code, KeyCode::Char(c) if !k.modifiers.intersects(Km::CONTROL | Km::ALT) && !c.is_whitespace());
         self.key0(k);
