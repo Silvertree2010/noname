@@ -100,10 +100,16 @@ Other flags go straight to `claude`.
 | `drag` | select and copy | `double / triple click` | copy word / line |
 | `ctrl+z` / `ctrl+y` | undo / redo input | `/copy` | copy last answer |
 | `ctrl+f` | find in chat | `/copy code` | copy last code block |
-| `alt+↑` / `alt+↓` | jump between prompts | | |
+| `alt+↑` / `alt+↓` | jump between prompts | `/voice` | dictate (see below) |
 | `ctrl+o` on a paste | unfold pasted text | | |
 
-Every Claude Code command and skill works as usual.
+Every Claude Code command and skill works as usual, except Claude Code's own `/voice`, which only works in its interactive screen; noname has its own.
+
+### Voice
+
+`/voice whisper` or `/voice parakeet` picks a speech model and downloads it once, together with [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (checked against pinned sha-256 sums, kept in `~/.local/share/noname/voice`, `%LOCALAPPDATA%\noname\voice` on Windows). After that `/voice` starts recording; `enter` puts the text in the input box, `esc` cancels. Everything runs on your machine. Whisper base is 148 MB and knows many languages; Parakeet TDT 0.6B v3 is 356 MB, 25 European languages, and more accurate. Linux needs `pw-record`, `parecord` or `arecord`; macOS is not supported yet (whisper.cpp publishes no macOS build).
+
+Don't need it? Build with `cargo build --release --no-default-features` and the voice code is left out of the program entirely.
 
 ### Custom themes
 

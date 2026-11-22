@@ -781,6 +781,14 @@ impl App {
                 .collect(),
         };
         v.retain(|x| x.0 != "theme");
+        #[cfg(feature = "voice")]
+        {
+            v.retain(|x| x.0 != "voice");
+            v.push((
+                "voice".into(),
+                "dictate: whisper or parakeet, runs on this machine".into(),
+            ));
+        }
         v.push(("noname".into(), "noname settings".into()));
         v.push((
             "default-permission".into(),
