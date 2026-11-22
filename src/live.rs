@@ -115,6 +115,7 @@ pub(crate) fn killall() {
     }
 }
 
+#[cfg(unix)]
 pub(crate) fn track_pid(id: i32) {
     if let Ok(mut k) = KIDS.lock() {
         k.push(id);

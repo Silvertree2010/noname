@@ -85,7 +85,7 @@ pub fn set_enabled(on: bool) {
     if let Some(d) = Path::new(&f).parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    let _ = std::fs::write(&f, if on { "on" } else { "off" });
+    let _ = sys::save(&f, if on { "on" } else { "off" });
 }
 
 fn now() -> u64 {
@@ -162,10 +162,53 @@ pub fn check(force: bool) -> Receiver<Up> {
     rx
 }
 
+struct Lock(PathBuf);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn lock_at(p: &Path) -> Option<Lock> {
+    use std::io::Write;
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    for _ in 0..2 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(p)
+        {
+            Ok(mut f) => {
+                let _ = write!(f, "{}", std::process::id());
+                return Some(Lock(p.to_path_buf()));
+            }
+            Err(_) if stale(p) => {
+                let _ = std::fs::remove_file(p);
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+fn stale(p: &Path) -> bool {
+    std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|e| e.as_secs() > 2 * 3600)
+}
+
 fn run(force: bool) -> Up {
     if let Some(m) = managed() {
         return Up::Skip(format!("updates come from {m}"));
     }
+    let Some(_l) = lock_at(&cache().with_file_name("update.lock")) else {
+        return Up::Skip("another noname is updating".into());
+    };
     if replaced() {
         return Up::Skip("noname was replaced on disk, restart to use it".into());
     }
@@ -183,7 +226,7 @@ fn run(force: bool) -> Up {
     if let Some(d) = Path::new(&f).parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    let _ = std::fs::write(&f, now().to_string());
+    let _ = sys::save(&f, now().to_string());
     if c.join(".git").is_dir() {
         if !ok(Command::new(&git)
             .arg("-C")
@@ -260,20 +303,38 @@ fn gone(p: &Path) -> bool {
 }
 
 fn swap(nb: &Path, me: &Path) -> std::io::Result<()> {
-    let tmp = me.with_extension("new");
-    std::fs::copy(nb, &tmp)?;
+    let tmp = me.with_extension(format!("new.{}", std::process::id()));
+    let r = put(nb, me, &tmp);
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
+}
+
+fn put(nb: &Path, me: &Path, tmp: &Path) -> std::io::Result<()> {
+    std::fs::copy(nb, tmp)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(tmp)?
+        .sync_all()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(0o755))?;
     }
     #[cfg(windows)]
-    {
-        let old = me.with_extension("old.exe");
-        let _ = std::fs::remove_file(&old);
-        std::fs::rename(me, &old)?;
+    let old = {
+        let o = me.with_extension("old.exe");
+        let _ = std::fs::remove_file(&o);
+        std::fs::rename(me, &o)?;
+        o
+    };
+    let r = std::fs::rename(tmp, me);
+    #[cfg(windows)]
+    if r.is_err() {
+        let _ = std::fs::rename(&old, me);
     }
-    std::fs::rename(&tmp, me)
+    r
 }
 
 fn newer(a: &str, b: &str) -> bool {
@@ -297,7 +358,7 @@ fn release() -> Up {
     if let Some(d) = Path::new(&f).parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    let _ = std::fs::write(&f, now().to_string());
+    let _ = sys::save(&f, now().to_string());
     let api =
         URL.replace("https://github.com/", "https://api.github.com/repos/") + "/releases/latest";
     let j = out(Command::new(&curl).args([
@@ -343,27 +404,33 @@ fn release() -> Up {
     else {
         return Up::Fail("no checksum in the release, not installed".into());
     };
-    let d = cache().with_file_name("dl");
+    let d = cache().with_file_name(format!("dl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(cache().with_file_name("dl"));
     let _ = std::fs::remove_dir_all(&d);
     if std::fs::create_dir_all(&d).is_err() {
         return Up::Fail("no cache folder".into());
     }
-    let arc = d.join(&name);
-    if !ok(Command::new(&curl)
+    let r = fetch(&curl, &tar, &url, &want, &d, &name, tag);
+    let _ = std::fs::remove_dir_all(&d);
+    r
+}
+
+fn fetch(curl: &Path, tar: &Path, url: &str, want: &str, d: &Path, name: &str, tag: String) -> Up {
+    let arc = d.join(name);
+    if !ok(Command::new(curl)
         .args(["-fsSL", "-A", "noname-updater", "-o"])
         .arg(&arc)
-        .arg(&url))
+        .arg(url))
     {
         return Up::Fail("download failed".into());
     }
     match std::fs::read(&arc) {
         Ok(b) if hex(&Sha256::digest(&b)) == want => {}
         _ => {
-            let _ = std::fs::remove_dir_all(&d);
             return Up::Fail("download does not match its checksum, not installed".into());
         }
     }
-    if !ok(Command::new(&tar).arg("-xf").arg(&arc).arg("-C").arg(&d)) {
+    if !ok(Command::new(tar).arg("-xf").arg(&arc).arg("-C").arg(d)) {
         return Up::Fail("could not unpack".into());
     }
     let nb = d.join(if cfg!(windows) {
@@ -411,6 +478,38 @@ mod tests {
         assert_eq!(sum_for(&t, "x.tar.gz"), None);
         assert_eq!(sum_for("abc  f", "f"), None);
         assert_eq!(sum_for("", "f"), None);
+    }
+
+    #[test]
+    fn only_one_update_runs_at_a_time() {
+        let d = std::env::temp_dir().join(format!("nn-upd-lock-{}", std::process::id()));
+        let p = d.join("update.lock");
+        let a = lock_at(&p).unwrap();
+        assert!(lock_at(&p).is_none());
+        drop(a);
+        assert!(!p.exists());
+        assert!(lock_at(&p).is_some());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn swap_puts_the_new_binary_in_place() {
+        let d = std::env::temp_dir().join(format!("nn-upd-swap-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let (nb, me) = (d.join("nb"), d.join("me.exe"));
+        std::fs::write(&nb, "new").unwrap();
+        std::fs::write(&me, "old").unwrap();
+        swap(&nb, &me).unwrap();
+        assert_eq!(std::fs::read_to_string(&me).unwrap(), "new");
+        assert!(swap(&d.join("missing"), &me).is_err());
+        let left: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .map(|x| x.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".new."))
+            .collect();
+        assert!(left.is_empty());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
