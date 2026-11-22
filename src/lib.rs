@@ -673,6 +673,7 @@ pub struct App {
     unre: bool,
     drf: Option<String>,
     hed: Vec<(usize, String)>,
+    dlg: Option<(String, u64, bool)>,
     /// Input box geometry of the last frame as (top row, height, text width).
     pub ig: Cell<(u16, u16, usize)>,
     /// Background tasks (shells, monitors, agents, workflows).
@@ -1013,6 +1014,7 @@ impl App {
             unre: false,
             drf: None,
             hed: vec![],
+            dlg: None,
             ig: Cell::new((0, 0, 0)),
             tasks: vec![],
             clip: String::new(),
@@ -1086,6 +1088,7 @@ impl App {
     /// Advances one tick: runs background polls, timers and update checks, then plays the next scripted step or pumps the live engine.
     pub fn step(&mut self) {
         self.t += 1;
+        self.dlgsync();
         self.fpoll();
         if let Some((s, true)) = self.tk {
             if self.t >= self.tkp + 30 {
@@ -1370,20 +1373,57 @@ impl App {
         }
     }
 
+    fn dlgsync(&mut self) {
+        let k = match (&self.qa, self.ask) {
+            (Some(q), _) => Some(format!("q{}#{}", q.id, q.i)),
+            (None, Some(i)) => Some(format!("a{i}")),
+            _ => None,
+        };
+        if self.dlg.as_ref().map(|d| &d.0) != k.as_ref() {
+            self.dlg = k.map(|k| (k, self.t, false));
+        }
+    }
+
+    fn armed(&self) -> bool {
+        self.dlg.as_ref().is_some_and(|d| self.t >= d.1 + QGRACE)
+    }
+
     fn qkey(&mut self, k: KeyEvent) -> bool {
+        let armed = self.armed();
+        let idle = self.inp.is_empty();
+        let nav = self.dlg.as_ref().is_some_and(|d| d.2);
         let Some(q) = &mut self.qa else { return false };
         let cur = &q.qs[q.i];
         let n = cur.opts.len();
         let other = q.sel == n;
         match k.code {
+            KeyCode::Esc if !armed => {
+                if !idle {
+                    self.clearinp();
+                }
+            }
             KeyCode::Esc => {
                 self.qdone(false);
                 return true;
             }
-            KeyCode::Up => q.sel = q.sel.saturating_sub(1),
-            KeyCode::Down => q.sel = (q.sel + 1).min(n),
+            KeyCode::Up | KeyCode::Down | KeyCode::Enter if !armed => {}
+            KeyCode::Up | KeyCode::Down => {
+                q.sel = if k.code == KeyCode::Up {
+                    q.sel.saturating_sub(1)
+                } else {
+                    (q.sel + 1).min(n)
+                };
+                if let Some(d) = &mut self.dlg {
+                    d.2 = true;
+                }
+            }
             KeyCode::Char(c)
-                if !other && c.is_ascii_digit() && c != '0' && (c as usize - '1' as usize) < n =>
+                if armed
+                    && idle
+                    && !other
+                    && c.is_ascii_digit()
+                    && c != '0'
+                    && (c as usize - '1' as usize) < n =>
             {
                 let j = c as usize - '1' as usize;
                 q.sel = j;
@@ -1393,7 +1433,9 @@ impl App {
                     self.qnext(cur_label(&self.qa, j));
                 }
             }
-            KeyCode::Char(' ') if !other && cur.multi => q.pick[q.sel] = !q.pick[q.sel],
+            KeyCode::Char(' ') if armed && idle && !other && cur.multi => {
+                q.pick[q.sel] = !q.pick[q.sel]
+            }
             KeyCode::Enter if other => {
                 let t = self.inp.trim().to_string();
                 if t.is_empty() {
@@ -1414,6 +1456,9 @@ impl App {
                 v.push(t);
                 self.qnext(v.join(", "));
             }
+            KeyCode::Enter if !idle && !nav => {
+                self.toast("question open  ·  ↑↓ to pick an answer, esc to dismiss")
+            }
             KeyCode::Enter => {
                 let a = if cur.multi {
                     let v: Vec<String> = cur
@@ -1433,7 +1478,7 @@ impl App {
                 };
                 self.qnext(a);
             }
-            _ => return !other,
+            _ => return false,
         }
         true
     }
@@ -2775,6 +2820,7 @@ impl App {
     }
 
     fn key0(&mut self, k: KeyEvent) {
+        self.dlgsync();
         let ct = k.modifiers.contains(Km::CONTROL);
         if ct && k.code == KeyCode::Char('c') {
             self.ctrlc();
@@ -3013,7 +3059,9 @@ impl App {
             KeyCode::Enter if k.modifiers.intersects(Km::SHIFT | Km::ALT) => self.ins('\n'),
             KeyCode::Enter => {
                 if self.ask.is_some() && self.inp.is_empty() {
-                    self.answer('y')
+                    if self.armed() {
+                        self.answer('y')
+                    }
                 } else {
                     self.submit()
                 }
@@ -3022,6 +3070,7 @@ impl App {
                 if !ct
                     && self.ask.is_some()
                     && self.inp.is_empty()
+                    && self.armed()
                     && matches!(c, 'y' | 'n' | 'a') =>
             {
                 self.answer(c)
@@ -4843,6 +4892,8 @@ fn editor(s: &str) -> Option<String> {
 /// Ticks (~33 ms) in which a second Ctrl+C exits: as long as the "press again" toast shows.
 const CC_WIN: u64 = 60;
 
+const QGRACE: u64 = 15;
+
 #[cfg(test)]
 mod ctrlc_tests {
     use super::*;
@@ -5610,6 +5661,108 @@ mod fix_tests {
         kc(&mut a, KeyCode::Left);
         kc(&mut a, KeyCode::Backspace);
         assert_eq!(a.inp, " ");
+    }
+
+    fn qa(id: &str) -> Qa {
+        Qa {
+            id: id.into(),
+            inp: serde_json::Value::Null,
+            qs: vec![Qq {
+                q: "Ready to code?".into(),
+                h: "plan".into(),
+                opts: (1..=4).map(|i| (format!("opt{i}"), String::new())).collect(),
+                multi: false,
+            }],
+            i: 0,
+            sel: 0,
+            pick: vec![false; 4],
+            ans: vec![],
+            plan: true,
+        }
+    }
+
+    #[test]
+    fn typing_does_not_answer_a_dialog_that_pops_up() {
+        let mut a = App::new();
+        a.t = 100;
+        typ(&mut a, "fix the");
+        a.qa = Some(qa("r1"));
+        a.step();
+        typ(&mut a, " 3");
+        assert!(a.qa.is_some());
+        assert_eq!(a.inp, "fix the 3");
+        a.t += QGRACE;
+        typ(&mut a, "2");
+        kc(&mut a, KeyCode::Enter);
+        assert!(a.qa.is_some());
+        assert_eq!(a.inp, "fix the 32");
+        kc(&mut a, KeyCode::Esc);
+        assert!(a.qa.is_none());
+        assert_eq!(a.inp, "fix the 32");
+    }
+
+    #[test]
+    fn dialog_answers_only_after_the_grace_period() {
+        let mut a = App::new();
+        a.t = 100;
+        a.qa = Some(qa("r2"));
+        typ(&mut a, "3");
+        kc(&mut a, KeyCode::Enter);
+        kc(&mut a, KeyCode::Down);
+        assert!(a.qa.as_ref().is_some_and(|q| q.sel == 0));
+        assert_eq!(a.inp, "3");
+        kc(&mut a, KeyCode::Esc);
+        assert!(a.qa.is_some());
+        assert_eq!(a.inp, "");
+        a.t += QGRACE;
+        kc(&mut a, KeyCode::Down);
+        kc(&mut a, KeyCode::Enter);
+        assert!(a.qa.is_none());
+        assert!(matches!(a.bs.last(), Some(B::Qa(_, x)) if x == "opt2"));
+        a.t += 1;
+        a.qa = Some(qa("r3"));
+        a.step();
+        a.t += QGRACE;
+        typ(&mut a, "3");
+        assert!(a.qa.is_none());
+        assert!(matches!(a.bs.last(), Some(B::Qa(_, x)) if x == "opt3"));
+    }
+
+    #[test]
+    fn dialog_with_draft_answers_after_navigation() {
+        let mut a = App::new();
+        a.t = 100;
+        typ(&mut a, "draft");
+        a.qa = Some(qa("r4"));
+        a.step();
+        a.t += QGRACE;
+        kc(&mut a, KeyCode::Enter);
+        assert!(a.qa.is_some());
+        kc(&mut a, KeyCode::Down);
+        kc(&mut a, KeyCode::Enter);
+        assert!(a.qa.is_none());
+        assert_eq!(a.inp, "draft");
+    }
+
+    #[test]
+    fn permission_prompt_has_a_grace_period() {
+        let mut a = App::new();
+        a.t = 100;
+        a.bs.push(B::Ask(Ask {
+            cmd: "git push".into(),
+            ans: None,
+        }));
+        a.ask = Some(a.bs.len() - 1);
+        a.step();
+        kc(&mut a, KeyCode::Enter);
+        typ(&mut a, "y");
+        assert!(a.ask.is_some());
+        assert_eq!(a.inp, "y");
+        a.inp.clear();
+        a.cur = 0;
+        a.t += QGRACE;
+        typ(&mut a, "n");
+        assert!(a.ask.is_none());
     }
 
     #[test]
