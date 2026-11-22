@@ -93,8 +93,16 @@ fn glitch(v: Vec<Span<'static>>, el: u64, t: u64) -> Vec<Span<'static>> {
     o
 }
 
+fn dlg(a: &App) -> bool {
+    a.qa.is_some() || a.ask.is_some()
+}
+
+fn atm(a: &App) -> Vec<String> {
+    if dlg(a) { vec![] } else { a.atmenu() }
+}
+
 fn menu(a: &App) -> Vec<(String, String)> {
-    let Some(q) = a.inp.strip_prefix('/') else {
+    let Some(q) = a.inp.strip_prefix('/').filter(|_| !dlg(a)) else {
         return vec![];
     };
     if q.contains(' ') || a.inp.contains('\n') {
@@ -1056,7 +1064,7 @@ impl V for V1 {
         if a.fs.is_some() {
             return false;
         }
-        let am = a.atmenu();
+        let am = atm(a);
         if !am.is_empty() && a.rw.is_none() && a.pk.is_none() && a.tk.is_none() {
             let sel = a.ms.min(am.len() - 1);
             match k.code {
@@ -1389,7 +1397,7 @@ impl V for V1 {
             }
             extra.push(Line::default());
         }
-        let am = a.atmenu();
+        let am = atm(a);
         if !am.is_empty() && a.rw.is_none() {
             let sel = a.ms.min(am.len() - 1);
             let lo = sel.saturating_sub(5).min(am.len().saturating_sub(6));
@@ -2801,6 +2809,51 @@ mod tests {
             ["https://example.com/src/main.rs"]
         );
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn popups_leave_keys_to_open_dialogs() {
+        let mut v = V1 {
+            db: [0.0; 3],
+            lt: 0,
+            sf: 0.0,
+            bg: None,
+        };
+        let ke = |c| Ke::new(c, M::NONE);
+        let qa = || noname::Qa {
+            id: "q".into(),
+            inp: serde_json::Value::Null,
+            qs: vec![noname::Qq {
+                q: "go?".into(),
+                h: String::new(),
+                opts: vec![("yes".into(), String::new()), ("no".into(), String::new())],
+                multi: false,
+            }],
+            i: 0,
+            sel: 0,
+            pick: vec![false; 2],
+            ans: vec![],
+            plan: true,
+        };
+        for inp in ["/cl", "@sr"] {
+            let mut a = App::new();
+            a.inp = inp.into();
+            a.cur = 3;
+            a.fsug = vec!["src/".into()];
+            assert!(!menu(&a).is_empty() || !atm(&a).is_empty(), "{inp}");
+            assert!(v.key(&ke(K::Down), &mut a), "{inp}");
+            a.qa = Some(qa());
+            assert!(menu(&a).is_empty() && atm(&a).is_empty(), "{inp}");
+            for k in [K::Up, K::Down, K::Enter] {
+                assert!(!v.key(&ke(k), &mut a), "{inp} {k:?}");
+            }
+            v.key(&ke(K::Tab), &mut a);
+            assert_eq!(a.inp, inp);
+            a.qa = None;
+            a.ask = Some(0);
+            assert!(!v.key(&ke(K::Enter), &mut a), "{inp}");
+            assert_eq!(a.inp, inp);
+        }
     }
 
     #[test]
