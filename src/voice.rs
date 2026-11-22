@@ -90,7 +90,7 @@ pub(crate) fn chosen() -> Option<&'static Model> {
 /// Remembers `m` for the next `/voice`.
 pub(crate) fn choose(m: &Model) {
     let _ = std::fs::create_dir_all(sys::cfgdir());
-    let _ = std::fs::write(sys::cfgfile("voice"), m.name);
+    let _ = sys::save(sys::cfgfile("voice"), m.name);
 }
 
 /// Folder for the engine, the models and the recording: `noname\voice` under `LOCALAPPDATA` on
@@ -107,12 +107,50 @@ fn dir() -> PathBuf {
 
 /// Path of the program `n` inside the unpacked engine (it sits one folder down).
 fn cli(n: &str) -> Option<PathBuf> {
+    cli_in(&dir().join("engine"), n)
+}
+
+fn cli_in(e: &Path, n: &str) -> Option<PathBuf> {
+    e.join(".done").is_file().then(|| seek(e, n)).flatten()
+}
+
+fn seek(e: &Path, n: &str) -> Option<PathBuf> {
     let n = format!("{n}{}", std::env::consts::EXE_SUFFIX);
-    let e = dir().join("engine");
-    std::iter::once(e.clone())
-        .chain(std::fs::read_dir(&e).ok()?.flatten().map(|x| x.path()))
+    std::iter::once(e.to_path_buf())
+        .chain(std::fs::read_dir(e).ok()?.flatten().map(|x| x.path()))
         .map(|d| d.join(&n))
         .find(|p| p.is_file())
+}
+
+fn unpack(tar: &Path, arc: &Path, d: &Path, n: &str) -> Result<(), String> {
+    let e = d.join("engine");
+    let t = d.join(format!("engine.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_dir_all(&t);
+    std::fs::create_dir_all(&t).map_err(|e| e.to_string())?;
+    let ok = Command::new(tar)
+        .arg("-xf")
+        .arg(arc)
+        .arg("-C")
+        .arg(&t)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if ok
+        && seek(&t, n).is_some()
+        && std::fs::write(t.join(".done"), "").is_ok()
+        && cli_in(&e, n).is_none()
+    {
+        let _ = std::fs::remove_dir_all(&e);
+        let _ = std::fs::rename(&t, &e);
+    }
+    let _ = std::fs::remove_dir_all(&t);
+    if cli_in(&e, n).is_some() {
+        Ok(())
+    } else {
+        Err("could not unpack whisper.cpp".into())
+    }
 }
 
 /// Whether engine and model of `m` are on disk.
@@ -126,7 +164,11 @@ pub(crate) fn got_mb() -> u64 {
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|x| x.path().extension().is_some_and(|e| e == "part"))
+        .filter(|x| {
+            x.file_name()
+                .to_string_lossy()
+                .ends_with(&format!(".{}.part", std::process::id()))
+        })
         .filter_map(|x| x.metadata().ok())
         .map(|x| x.len())
         .sum::<u64>()
@@ -146,32 +188,19 @@ fn get(m: &Model) -> Result<(), String> {
     let curl = sys::which("curl").ok_or("needs curl")?;
     let d = dir();
     std::fs::create_dir_all(&d).map_err(|e| format!("no voice folder: {e}"))?;
+    sweep();
     if cli(m.cli).is_none() {
         let (name, sha) = engine().ok_or("no whisper.cpp build for this system")?;
         let tar = sys::which("tar").ok_or("needs tar")?;
-        let arc = d.join(format!("{name}.part"));
+        let arc = d.join(format!("{name}.{}.part", std::process::id()));
         dl(&curl, &format!("{WCPP}{name}"), &arc, sha)?;
-        let e = d.join("engine");
-        let _ = std::fs::remove_dir_all(&e);
-        let _ = std::fs::create_dir_all(&e);
-        let ok = Command::new(tar)
-            .arg("-xf")
-            .arg(&arc)
-            .arg("-C")
-            .arg(&e)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
+        let r = unpack(&tar, &arc, &d, m.cli);
         let _ = std::fs::remove_file(&arc);
-        if !ok || cli(m.cli).is_none() {
-            return Err("could not unpack whisper.cpp".into());
-        }
+        r?;
     }
     let f = d.join(m.file);
     if !f.is_file() {
-        let p = d.join(format!("{}.part", m.file));
+        let p = d.join(format!("{}.{}.part", m.file, std::process::id()));
         dl(&curl, m.url, &p, m.sha)?;
         std::fs::rename(&p, &f).map_err(|e| e.to_string())?;
     }
@@ -215,7 +244,28 @@ pub(crate) struct Rec {
 }
 
 fn wav() -> PathBuf {
-    dir().join("rec.wav")
+    dir().join(format!("rec-{}.wav", std::process::id()))
+}
+
+fn sweep() {
+    let old = |x: &std::fs::DirEntry| {
+        x.metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|e| e.as_secs() > 86_400)
+    };
+    for x in std::fs::read_dir(dir()).into_iter().flatten().flatten() {
+        let n = x.file_name().to_string_lossy().to_string();
+        if !old(&x) {
+            continue;
+        }
+        if n.starts_with("rec") && n.ends_with(".wav") || n.ends_with(".part") {
+            let _ = std::fs::remove_file(x.path());
+        } else if n.starts_with("engine.") && n.ends_with(".tmp") {
+            let _ = std::fs::remove_dir_all(x.path());
+        }
+    }
 }
 
 impl Rec {
@@ -225,6 +275,7 @@ impl Rec {
     pub(crate) fn start() -> Result<Rec, String> {
         let w = wav();
         let _ = std::fs::create_dir_all(dir());
+        sweep();
         let _ = std::fs::remove_file(&w);
         let ws = w.to_string_lossy().to_string();
         let tries: [(&str, Vec<&str>); 3] = [
@@ -259,6 +310,7 @@ impl Rec {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("could not record: {e}"))?;
+        crate::live::track_child(&ch);
         Ok(Rec {
             t: Instant::now(),
             ch,
@@ -269,6 +321,7 @@ impl Rec {
     #[cfg(windows)]
     pub(crate) fn start() -> Result<Rec, String> {
         let _ = std::fs::create_dir_all(dir());
+        sweep();
         mci("close nnrec");
         if mci("open new type waveaudio alias nnrec") != 0 {
             return Err("no microphone found".into());
@@ -291,6 +344,7 @@ impl Rec {
             // SAFETY: kill only sends a signal to the pid of our own child, which is not reaped yet.
             unsafe { libc::kill(self.ch.id() as i32, libc::SIGINT) };
             let _ = self.ch.wait();
+            crate::live::untrack_pid(self.ch.id() as i32);
         }
         #[cfg(windows)]
         {
@@ -315,6 +369,7 @@ impl Drop for Rec {
         if matches!(self.ch.try_wait(), Ok(None)) {
             let _ = self.ch.kill();
             let _ = self.ch.wait();
+            crate::live::untrack_pid(self.ch.id() as i32);
             let _ = std::fs::remove_file(wav());
         }
         #[cfg(windows)]
@@ -511,6 +566,30 @@ mod tests {
         assert_eq!(find("parakeet").map(|m| m.cli), Some("parakeet-cli"));
         assert!(find("nope").is_none());
         assert!(MODELS.iter().all(|m| m.sha.len() == 64));
+    }
+
+    #[test]
+    fn an_engine_counts_only_once_unpacked_completely() {
+        let d = std::env::temp_dir().join(format!("nn-voice-eng-{}", std::process::id()));
+        let b = d.join("Release");
+        std::fs::create_dir_all(&b).unwrap();
+        let n = format!("whisper-cli{}", std::env::consts::EXE_SUFFIX);
+        std::fs::write(b.join(&n), "").unwrap();
+        assert_eq!(seek(&d, "whisper-cli"), Some(b.join(&n)));
+        assert!(cli_in(&d, "whisper-cli").is_none());
+        std::fs::write(d.join(".done"), "").unwrap();
+        assert_eq!(cli_in(&d, "whisper-cli"), Some(b.join(&n)));
+        assert!(cli_in(&d, "parakeet-cli").is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_recording_is_per_process() {
+        assert!(
+            wav()
+                .to_string_lossy()
+                .contains(&std::process::id().to_string())
+        );
     }
 
     #[test]
