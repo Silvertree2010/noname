@@ -76,11 +76,15 @@ fn glitch(v: Vec<Span<'static>>, el: u64, t: u64) -> Vec<Span<'static>> {
         let mut run = String::new();
         for c in sp.content.chars() {
             k += 1;
-            if c != ' ' && hsh(t / 2, k) % 6 == 0 {
+            if c != ' ' && hsh(t / 2, k).is_multiple_of(6) {
                 if !run.is_empty() {
                     o.push(Span::styled(std::mem::take(&mut run), sp.style));
                 }
-                let gc = if hsh(t, k) % 2 == 0 { RD() } else { PK() };
+                let gc = if hsh(t, k).is_multiple_of(2) {
+                    RD()
+                } else {
+                    PK()
+                };
                 o.push(Span::styled(nz(t, k).to_string(), st(gc).bold()));
             } else {
                 run.push(c);
@@ -289,20 +293,18 @@ fn gline(a: &App, ix: &[usize], w: usize) -> Vec<Line<'static>> {
         vec![]
     };
     let mut v = vec![lr(l, r, w)];
-    if run {
-        if let Some(t) = ts.iter().rev().find(|t| t.st == St::Run) {
-            let (c, _) = sy(t.k);
-            let mut s = t.a.clone();
-            let mx = w.saturating_sub(10);
-            if s.chars().count() > mx {
-                s = s.chars().take(mx.saturating_sub(1)).collect::<String>() + "~";
-            }
-            v.push(Line::from(vec![
-                pad(4),
-                Span::styled(format!("{c} "), st(FA())),
-                Span::styled(s, st(FA())),
-            ]));
+    if run && let Some(t) = ts.iter().rev().find(|t| t.st == St::Run) {
+        let (c, _) = sy(t.k);
+        let mut s = t.a.clone();
+        let mx = w.saturating_sub(10);
+        if s.chars().count() > mx {
+            s = s.chars().take(mx.saturating_sub(1)).collect::<String>() + "~";
         }
+        v.push(Line::from(vec![
+            pad(4),
+            Span::styled(format!("{c} "), st(FA())),
+            Span::styled(s, st(FA())),
+        ]));
     }
     v
 }
@@ -375,36 +377,37 @@ fn links(bl: &[Line], a: usize, b: usize, w: usize) -> Vec<(usize, u16, u16, Str
         pg = Some((gk.clone(), ek, wk));
         if k + 1 < b {
             nx = cols(&bl[k + 1]);
-            if let Some(&(lx, lc, lw)) = cur.last() {
-                if !lc.is_whitespace() && lx + lw == w {
-                    // the last word of this line, and where it starts
-                    let p = cs[st..]
+            if let Some(&(lx, lc, lw)) = cur.last()
+                && !lc.is_whitespace()
+                && lx + lw == w
+            {
+                // the last word of this line, and where it starts
+                let p = cs[st..]
+                    .iter()
+                    .rev()
+                    .take_while(|c| !c.2.is_whitespace())
+                    .last()
+                    .map(|c| c.1)
+                    .unwrap_or(0);
+                let cont = nx
+                    .iter()
+                    .find(|c| c.0 >= p)
+                    .is_some_and(|c| c.0 == p && !c.1.is_whitespace());
+                if cont
+                    && nx
                         .iter()
-                        .rev()
-                        .take_while(|c| !c.2.is_whitespace())
-                        .last()
-                        .map(|c| c.1)
-                        .unwrap_or(0);
-                    let cont = nx
-                        .iter()
-                        .find(|c| c.0 >= p)
-                        .is_some_and(|c| c.0 == p && !c.1.is_whitespace());
-                    if cont
-                        && nx
-                            .iter()
-                            .take_while(|c| c.0 < p)
-                            .all(|c| c.1.is_whitespace())
-                    {
-                        from = p;
-                        continue;
-                    }
-                    // a code block line: the word is all the text behind the `|` gutter and
-                    // goes on in the next line, a wrapped part of the same code line
-                    let (gn, en) = gutter(&nx);
-                    if p == ek && en < usize::MAX && wrapped(wk, &gk, ek, &gn, en) {
-                        from = en;
-                        continue;
-                    }
+                        .take_while(|c| c.0 < p)
+                        .all(|c| c.1.is_whitespace())
+                {
+                    from = p;
+                    continue;
+                }
+                // a code block line: the word is all the text behind the `|` gutter and
+                // goes on in the next line, a wrapped part of the same code line
+                let (gn, en) = gutter(&nx);
+                if p == ek && en < usize::MAX && wrapped(wk, &gk, ek, &gn, en) {
+                    from = en;
+                    continue;
                 }
             }
         }
@@ -635,6 +638,11 @@ fn body(a: &App, w: usize) -> Vec<Line<'static>> {
         tl0 = v.len();
         match b {
             B::U(s, _) => {
+                let s = &*if s.contains('\u{2060}') {
+                    std::borrow::Cow::Owned(s.replace('\u{2060}', ""))
+                } else {
+                    std::borrow::Cow::Borrowed(s.as_str())
+                };
                 let el = if fly && lu == Some(i) {
                     a.t.saturating_sub(a.ts) * 3
                 } else {
@@ -884,19 +892,19 @@ fn body(a: &App, w: usize) -> Vec<Line<'static>> {
                         if s.chars().count() > w.saturating_sub(14) {
                             s = s.chars().take(w.saturating_sub(15)).collect::<String>() + "~";
                         }
-                        if t.k == Tk::Grep {
-                            if let Ln::P(x) = ln {
-                                let tok = x.split_whitespace().next().unwrap_or("");
-                                let fp = tok.split(':').next().unwrap_or("");
-                                if !fp.is_empty() && std::path::Path::new(fp).is_file() {
-                                    let tg = tok
-                                        .trim_end_matches(':')
-                                        .split(':')
-                                        .take(2)
-                                        .collect::<Vec<_>>()
-                                        .join(":");
-                                    link(v.len(), 12, tok.chars().count(), &tg);
-                                }
+                        if t.k == Tk::Grep
+                            && let Ln::P(x) = ln
+                        {
+                            let tok = x.split_whitespace().next().unwrap_or("");
+                            let fp = tok.split(':').next().unwrap_or("");
+                            if !fp.is_empty() && std::path::Path::new(fp).is_file() {
+                                let tg = tok
+                                    .trim_end_matches(':')
+                                    .split(':')
+                                    .take(2)
+                                    .collect::<Vec<_>>()
+                                    .join(":");
+                                link(v.len(), 12, tok.chars().count(), &tg);
                             }
                         }
                         let mut sp = vec![
@@ -1123,12 +1131,12 @@ impl V for V1 {
                 a.cur = a.inp.chars().count();
                 return true;
             }
-            if a.inp.is_empty() {
-                if let Some(x) = a.sug.take() {
-                    a.inp = x;
-                    a.cur = a.inp.chars().count();
-                    return true;
-                }
+            if a.inp.is_empty()
+                && let Some(x) = a.sug.take()
+            {
+                a.inp = x;
+                a.cur = a.inp.chars().count();
+                return true;
             }
             return k.code == K::Tab;
         }
@@ -1375,24 +1383,22 @@ impl V for V1 {
                     Span::styled(if on { "› " } else { "  " }, st(LI()).bold()),
                     Span::styled(t, if on { st(WH()).bold() } else { st(MU()) }),
                 ]));
-                if on {
-                    if let Some(o) = opt {
-                        let mut sp = vec![pad(4)];
-                        for (k, l) in ["code + conversation", "conversation", "code"]
-                            .iter()
-                            .enumerate()
-                        {
-                            if k > 0 {
-                                sp.push(pad(4));
-                            }
-                            if k == o {
-                                sp.push(Span::styled(format!("[ {l} ]"), st(LI()).bold()));
-                            } else {
-                                sp.push(Span::styled(format!("  {l}  "), st(FA())));
-                            }
+                if on && let Some(o) = opt {
+                    let mut sp = vec![pad(4)];
+                    for (k, l) in ["code + conversation", "conversation", "code"]
+                        .iter()
+                        .enumerate()
+                    {
+                        if k > 0 {
+                            sp.push(pad(4));
                         }
-                        extra.push(Line::from(sp));
+                        if k == o {
+                            sp.push(Span::styled(format!("[ {l} ]"), st(LI()).bold()));
+                        } else {
+                            sp.push(Span::styled(format!("  {l}  "), st(FA())));
+                        }
                     }
+                    extra.push(Line::from(sp));
                 }
             }
             extra.push(Line::default());
@@ -2137,13 +2143,15 @@ impl V for V1 {
             if j == 0 {
                 if let Some((rest, _)) = &gh {
                     sp.push(Span::styled(rest.clone(), st(FA())));
-                } else if a.inp.is_empty() && !a.busy && a.ask.is_none() {
-                    if let Some(x) = &a.sug {
-                        sp.push(Span::styled(
-                            x.lines().next().unwrap_or("").to_string(),
-                            st(FA()).italic(),
-                        ));
-                    }
+                } else if a.inp.is_empty()
+                    && !a.busy
+                    && a.ask.is_none()
+                    && let Some(x) = &a.sug
+                {
+                    sp.push(Span::styled(
+                        x.lines().next().unwrap_or("").to_string(),
+                        st(FA()).italic(),
+                    ));
                 }
             }
             let dn = il.len().saturating_sub(sk + ih);
@@ -2277,11 +2285,11 @@ impl V for V1 {
         ));
         // effort sits on the usage line, on the side opposite the bars; with usage off it stays by the model
         let eff = (!a.effs.is_empty()).then(|| vec![Span::styled(a.effs.clone(), st(FA()))]);
-        if lay(1) == 4 {
-            if let Some(e) = &eff {
-                model.push(pad(2));
-                model.extend(e.clone());
-            }
+        if lay(1) == 4
+            && let Some(e) = &eff
+        {
+            model.push(pad(2));
+            model.extend(e.clone());
         }
         let cwd = vec![
             Span::styled(a.cwd.clone(), st(MU())),

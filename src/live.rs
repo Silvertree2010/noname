@@ -219,10 +219,10 @@ fn rd(r: impl io::Read + Send + 'static) -> Receiver<Value> {
     thread::spawn(move || {
         for l in BufReader::new(r).lines() {
             let Ok(l) = l else { break };
-            if let Ok(v) = serde_json::from_str::<Value>(&l) {
-                if tx.send(v).is_err() {
-                    break;
-                }
+            if let Ok(v) = serde_json::from_str::<Value>(&l)
+                && tx.send(v).is_err()
+            {
+                break;
             }
         }
         let _ = tx.send(json!({"type": "_eof"}));
@@ -368,10 +368,10 @@ fn rel(p: &str) -> String {
     if let Some(r) = p.strip_prefix(&format!("{cwd}{}", std::path::MAIN_SEPARATOR)) {
         return r.to_string();
     }
-    if !h.is_empty() {
-        if let Some(r) = p.strip_prefix(&h) {
-            return format!("~{r}");
-        }
+    if !h.is_empty()
+        && let Some(r) = p.strip_prefix(&h)
+    {
+        return format!("~{r}");
     }
     p.to_string()
 }
@@ -439,12 +439,12 @@ impl App {
     }
 
     fn subact(&mut self, p: &str, line: String) {
-        if let Some(i) = self.lv.as_ref().and_then(|l| l.tm.get(p).copied()) {
-            if let Some(B::Tl(t)) = self.bs.get_mut(i) {
-                t.body.push(Ln::P(one(&line, 200)));
-                if t.body.len() > 600 {
-                    t.body.remove(0);
-                }
+        if let Some(i) = self.lv.as_ref().and_then(|l| l.tm.get(p).copied())
+            && let Some(B::Tl(t)) = self.bs.get_mut(i)
+        {
+            t.body.push(Ln::P(one(&line, 200)));
+            if t.body.len() > 600 {
+                t.body.remove(0);
             }
         }
         if let Some(t) = self.tasks.iter_mut().find(|t| t.tool == p) {
@@ -845,20 +845,18 @@ impl App {
         if !args
             .iter()
             .any(|x| x.starts_with("--permission-mode") || x == "--dangerously-skip-permissions")
+            && let Some(i) = crate::defmode().filter(|i| *i > 0)
         {
-            if let Some(i) = crate::defmode().filter(|i| *i > 0) {
-                args.extend(["--permission-mode".into(), PM[i].into()]);
-                a.mode = i;
-            }
+            args.extend(["--permission-mode".into(), PM[i].into()]);
+            a.mode = i;
         }
         if !args
             .iter()
             .any(|x| x == "--effort" || x.starts_with("--effort="))
+            && let Some(e) = crate::defeff()
         {
-            if let Some(e) = crate::defeff() {
-                args.extend(["--effort".into(), e.into()]);
-                a.effs = e.into();
-            }
+            args.extend(["--effort".into(), e.into()]);
+            a.effs = e.into();
         }
         let (ch, inp, rx) = spawn(&args).map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
@@ -1342,12 +1340,12 @@ impl App {
             self.qdone(false);
         }
         for b in self.bs.iter_mut() {
-            if let B::Tl(t) = b {
-                if t.st == St::Run {
-                    t.st = St::Err;
-                    t.t1 = self.t;
-                    t.sum = "interrupted".into();
-                }
+            if let B::Tl(t) = b
+                && t.st == St::Run
+            {
+                t.st = St::Err;
+                t.t1 = self.t;
+                t.sum = "interrupted".into();
             }
         }
         self.sb = None;
@@ -1590,10 +1588,10 @@ impl App {
             if let Some(l) = &mut self.lv {
                 l.areq = None;
             }
-            if let Some(i) = self.ask.take() {
-                if let Some(B::Ask(a)) = self.bs.get_mut(i) {
-                    a.ans = Some('n');
-                }
+            if let Some(i) = self.ask.take()
+                && let Some(B::Ask(a)) = self.bs.get_mut(i)
+            {
+                a.ans = Some('n');
             }
         }
         if self.qa.as_ref().is_some_and(|q| q.id == id) {
@@ -2121,12 +2119,11 @@ impl App {
                         .is_some_and(|a| a.iter().any(|x| x["type"] == "text"));
                 if txt {
                     let u = sv(&e, "uuid");
-                    if !u.is_empty() {
-                        if let Some(i) = self.bs.iter().rposition(|b| matches!(b, B::U(..))) {
-                            if let Some(l) = &mut self.lv {
-                                l.uid.entry(i).or_insert(u);
-                            }
-                        }
+                    if !u.is_empty()
+                        && let Some(i) = self.bs.iter().rposition(|b| matches!(b, B::U(..)))
+                        && let Some(l) = &mut self.lv
+                    {
+                        l.uid.entry(i).or_insert(u);
                     }
                 }
                 if let Some(a) = e["message"]["content"].as_array() {
@@ -2248,10 +2245,10 @@ impl App {
                         }
                         None => self.toast("files restored"),
                     }
-                    if let Some((i, conv)) = self.lv.as_mut().and_then(|l| l.rwp.take()) {
-                        if conv {
-                            self.rconv(i);
-                        }
+                    if let Some((i, conv)) = self.lv.as_mut().and_then(|l| l.rwp.take())
+                        && conv
+                    {
+                        self.rconv(i);
                     }
                 } else if let Some(r) = id.strip_prefix("tko") {
                     let i: usize = r
@@ -2302,11 +2299,11 @@ impl App {
                             (sv(x, "name"), r, sv(x, "name"))
                         })
                         .collect();
-                    if let Some(k) = &mut self.pk {
-                        if k.kind == 2 {
-                            k.sel = k.sel.min(rows.len().saturating_sub(1));
-                            k.items = rows;
-                        }
+                    if let Some(k) = &mut self.pk
+                        && k.kind == 2
+                    {
+                        k.sel = k.sel.min(rows.len().saturating_sub(1));
+                        k.items = rows;
                     }
                 } else if id.starts_with("mcr") || id.starts_with("mct") {
                     if r["subtype"] == "error" {
@@ -2343,16 +2340,16 @@ impl App {
                         })
                         .collect();
                     let s = &d["stats"];
-                    if let Some(k) = &mut self.pk {
-                        if k.kind == 3 {
-                            k.title = format!(
-                                "diff  {} files  +{} -{}",
-                                s["filesCount"].as_u64().unwrap_or(0),
-                                s["linesAdded"].as_u64().unwrap_or(0),
-                                s["linesRemoved"].as_u64().unwrap_or(0)
-                            );
-                            k.items = rows;
-                        }
+                    if let Some(k) = &mut self.pk
+                        && k.kind == 3
+                    {
+                        k.title = format!(
+                            "diff  {} files  +{} -{}",
+                            s["filesCount"].as_u64().unwrap_or(0),
+                            s["linesAdded"].as_u64().unwrap_or(0),
+                            s["linesRemoved"].as_u64().unwrap_or(0)
+                        );
+                        k.items = rows;
                     }
                     if r["subtype"] == "error" {
                         self.toast(one(&sv(r, "error"), 60));
@@ -2407,17 +2404,17 @@ impl App {
                     .any(|b| matches!(b, B::T(_) | B::Tl(_)));
                 if (quiet || e["is_error"] == true) && !txt.trim().is_empty() {
                     self.bs.push(B::T(txt));
-                } else if txt.trim().is_empty() {
-                    if let Some(x) = rerr(&e) {
-                        self.bs.push(B::Sys(x));
-                    }
+                } else if txt.trim().is_empty()
+                    && let Some(x) = rerr(&e)
+                {
+                    self.bs.push(B::Sys(x));
                 }
                 for b in self.bs.iter_mut() {
-                    if let B::Tl(t) = b {
-                        if t.st == St::Run {
-                            t.st = St::Ok;
-                            t.t1 = self.t;
-                        }
+                    if let B::Tl(t) = b
+                        && t.st == St::Run
+                    {
+                        t.st = St::Ok;
+                        t.t1 = self.t;
                     }
                 }
                 let tot = e["total_cost_usd"].as_f64().unwrap_or(0.0);
@@ -2452,10 +2449,10 @@ impl App {
                     l.pq.clear();
                 }
                 self.lgone("stopped: the Claude session ended");
-                if let Some(i) = self.ask.take() {
-                    if let Some(B::Ask(a)) = self.bs.get_mut(i) {
-                        a.ans = Some('n');
-                    }
+                if let Some(i) = self.ask.take()
+                    && let Some(B::Ask(a)) = self.bs.get_mut(i)
+                {
+                    a.ans = Some('n');
                 }
                 self.qa = None;
                 self.sb = None;
@@ -2712,21 +2709,21 @@ impl App {
         let id = sv(c, "id");
         let name = sv(c, "name");
         let mut t = mk(&name, &c["input"]);
-        if name == "TodoWrite" {
-            if let Some(ts) = c["input"]["todos"].as_array() {
-                self.todo = ts
-                    .iter()
-                    .map(|x| {
-                        let s = match x["status"].as_str().unwrap_or("") {
-                            "completed" => 2,
-                            "in_progress" => 1,
-                            _ => 0,
-                        };
-                        (s, sv(x, "content"))
-                    })
-                    .collect();
-                t.a = format!("{} items", self.todo.len());
-            }
+        if name == "TodoWrite"
+            && let Some(ts) = c["input"]["todos"].as_array()
+        {
+            self.todo = ts
+                .iter()
+                .map(|x| {
+                    let s = match x["status"].as_str().unwrap_or("") {
+                        "completed" => 2,
+                        "in_progress" => 1,
+                        _ => 0,
+                    };
+                    (s, sv(x, "content"))
+                })
+                .collect();
+            t.a = format!("{} items", self.todo.len());
         }
         let ex = self.lv.as_ref().and_then(|l| l.tm.get(&id).copied());
         match ex {

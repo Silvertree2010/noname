@@ -123,11 +123,11 @@ impl App {
             "step_update" => self.agstep(&e["step_update"]),
             "result" => self.agresult(&e["result"]),
             "_stderr" => {
-                if let Some(c) = &mut self.cx {
-                    if c.err.len() < 4000 {
-                        c.err.push_str(&sv(&e, "text"));
-                        c.err.push('\n');
-                    }
+                if let Some(c) = &mut self.cx
+                    && c.err.len() < 4000
+                {
+                    c.err.push_str(&sv(&e, "text"));
+                    c.err.push('\n');
                 }
             }
             _ if e["type"] == "_eof" => {
@@ -206,10 +206,11 @@ impl App {
 
     fn agstep(&mut self, s: &Value) {
         let id = sv(s, "conversation_id");
-        if let Some(c) = &mut self.cx {
-            if c.tid.is_none() && !id.is_empty() {
-                c.tid = Some(id);
-            }
+        if let Some(c) = &mut self.cx
+            && c.tid.is_none()
+            && !id.is_empty()
+        {
+            c.tid = Some(id);
         }
         let key = format!("s{}", s["step_index"].as_u64().unwrap_or(u64::MAX));
         let done = sv(s, "state") == "DONE";

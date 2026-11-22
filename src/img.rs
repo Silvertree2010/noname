@@ -114,15 +114,15 @@ fn undec(s: &str) -> String {
     let mut o = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let Some(v) = std::str::from_utf8(&b[i + 1..i + 3])
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let Some(v) = std::str::from_utf8(&b[i + 1..i + 3])
                 .ok()
                 .and_then(|h| u8::from_str_radix(h, 16).ok())
-            {
-                o.push(v);
-                i += 3;
-                continue;
-            }
+        {
+            o.push(v);
+            i += 3;
+            continue;
         }
         o.push(b[i]);
         i += 1;
@@ -325,11 +325,11 @@ fn clip_win(txt: bool) -> Clip {
     crate::sys::guard(&mut c);
     if let Some(o) = out(&mut c) {
         let s = String::from_utf8_lossy(&o).trim().to_string();
-        if s == "ok" {
-            if let Ok(b) = std::fs::read(&tmp) {
-                let _ = std::fs::remove_file(&tmp);
-                return Clip::Img(b);
-            }
+        if s == "ok"
+            && let Ok(b) = std::fs::read(&tmp)
+        {
+            let _ = std::fs::remove_file(&tmp);
+            return Clip::Img(b);
         }
         if txt {
             // 'text' on the first line, then the clipboard text as it was
@@ -370,19 +370,18 @@ pub fn clip() -> Clip {
         let ty = ty
             .map(|b| String::from_utf8_lossy(&b).into_owned())
             .unwrap_or_default();
-        if let Some(t) = pick(&ty) {
-            if let Some(b) = out(Command::new("wl-paste").args(["--no-newline", "--type", t])) {
-                return Clip::Img(b);
-            }
+        if let Some(t) = pick(&ty)
+            && let Some(b) = out(Command::new("wl-paste").args(["--no-newline", "--type", t]))
+        {
+            return Clip::Img(b);
         }
-        if ty.lines().any(|l| l.trim() == "text/uri-list") {
-            if let Some(b) =
+        if ty.lines().any(|l| l.trim() == "text/uri-list")
+            && let Some(b) =
                 out(Command::new("wl-paste").args(["--no-newline", "--type", "text/uri-list"]))
-            {
-                let v = uris(&b);
-                if !v.is_empty() {
-                    return Clip::Files(v);
-                }
+        {
+            let v = uris(&b);
+            if !v.is_empty() {
+                return Clip::Files(v);
             }
         }
         return match out(Command::new("wl-paste").arg("--no-newline")) {
@@ -399,25 +398,24 @@ pub fn clip() -> Clip {
         let ty = ty
             .map(|b| String::from_utf8_lossy(&b).into_owned())
             .unwrap_or_default();
-        if let Some(t) = pick(&ty) {
-            if let Some(b) =
+        if let Some(t) = pick(&ty)
+            && let Some(b) =
                 out(Command::new("xclip").args(["-selection", "clipboard", "-t", t, "-o"]))
-            {
-                return Clip::Img(b);
-            }
+        {
+            return Clip::Img(b);
         }
-        if ty.lines().any(|l| l.trim() == "text/uri-list") {
-            if let Some(b) = out(Command::new("xclip").args([
+        if ty.lines().any(|l| l.trim() == "text/uri-list")
+            && let Some(b) = out(Command::new("xclip").args([
                 "-selection",
                 "clipboard",
                 "-t",
                 "text/uri-list",
                 "-o",
-            ])) {
-                let v = uris(&b);
-                if !v.is_empty() {
-                    return Clip::Files(v);
-                }
+            ]))
+        {
+            let v = uris(&b);
+            if !v.is_empty() {
+                return Clip::Files(v);
             }
         }
         return match out(Command::new("xclip").args(["-selection", "clipboard", "-o"])) {
@@ -474,11 +472,11 @@ pub fn shrink(b: Vec<u8>) -> Result<(Vec<u8>, &'static str), usize> {
             .is_ok_and(|s| s.success());
         let r = if ok { std::fs::read(&dst).ok() } else { None };
         let _ = std::fs::remove_file(&dst);
-        if let Some(r) = r {
-            if r.len() <= MAX {
-                best = Ok((r, "image/jpeg"));
-                break;
-            }
+        if let Some(r) = r
+            && r.len() <= MAX
+        {
+            best = Ok((r, "image/jpeg"));
+            break;
         }
     }
     let _ = std::fs::remove_dir_all(&d);
