@@ -368,6 +368,9 @@ pub fn open(path: &str, line: &str) {
         let mut c = Command::new(v.next().unwrap_or_default());
         c.args(v);
         c
+    } else if runs(std::path::Path::new(path)) {
+        reveal(path);
+        return;
     } else if cfg!(target_os = "macos") {
         let mut c = Command::new("open");
         c.arg(path);
@@ -494,9 +497,6 @@ pub fn exists(p: &str) -> bool {
     })
 }
 
-/// Opens a folder in a new file manager window (on GNOME a new Files window, even
-/// when one is already open).
-pub fn open_dir(path: &str) {
 const AUTO: [&str; 6] = ["/net", "/network", "/afs", "/misc", "/smb", "/nfs"];
 
 fn norm(p: &std::path::Path) -> String {
@@ -586,7 +586,13 @@ fn stat(p: PathBuf) -> Option<bool> {
     })
 }
 
-    let mut c = if cfg!(target_os = "macos") {
+/// Opens a folder in a new file manager window (on GNOME a new Files window, even
+/// when one is already open).
+pub fn open_dir(path: &str) {
+    let mut c = if cfg!(target_os = "macos") && runs(std::path::Path::new(path)) {
+        reveal(path);
+        return;
+    } else if cfg!(target_os = "macos") {
         let mut c = Command::new("open");
         c.arg(path);
         c
@@ -612,6 +618,182 @@ fn stat(p: PathBuf) -> Option<bool> {
         c.process_group(0);
     }
     detach(&mut c);
+}
+
+const RUN: &[&str] = &[
+    "exe",
+    "com",
+    "bat",
+    "cmd",
+    "btm",
+    "ps1",
+    "psm1",
+    "psd1",
+    "ps1xml",
+    "vbs",
+    "vbe",
+    "js",
+    "jse",
+    "wsf",
+    "wsh",
+    "wsc",
+    "msi",
+    "msp",
+    "mst",
+    "lnk",
+    "url",
+    "scr",
+    "pif",
+    "hta",
+    "cpl",
+    "msc",
+    "jar",
+    "reg",
+    "inf",
+    "scf",
+    "appref-ms",
+    "application",
+    "gadget",
+    "settingcontent-ms",
+    "library-ms",
+    "search-ms",
+    "searchconnector-ms",
+    "appx",
+    "appxbundle",
+    "msix",
+    "msixbundle",
+    "appinstaller",
+    "diagcab",
+    "chm",
+    "xll",
+    "website",
+    "iso",
+    "img",
+    "vhd",
+    "vhdx",
+    "app",
+    "command",
+    "tool",
+    "terminal",
+    "workflow",
+    "action",
+    "pkg",
+    "mpkg",
+    "fileloc",
+    "prefpane",
+    "saver",
+    "kext",
+    "mobileconfig",
+    "shortcut",
+    "desktop",
+    "appimage",
+    "deb",
+    "rpm",
+    "flatpakref",
+    "snap",
+];
+
+const SCR: &[&str] = &[
+    "py", "pyw", "pyz", "pyc", "pl", "rb", "sh", "bash", "zsh", "tcl",
+];
+
+fn ext(p: &std::path::Path) -> Option<String> {
+    let n = p.file_name()?.to_string_lossy().to_lowercase();
+    let n = n.trim_end_matches(['.', ' ']);
+    n.rsplit_once('.').map(|x| x.1.to_string())
+}
+
+fn launcher(p: &std::path::Path) -> bool {
+    ext(p).is_some_and(|e| {
+        RUN.contains(&e.as_str())
+            || (cfg!(any(windows, target_os = "macos")) && SCR.contains(&e.as_str()))
+            || (cfg!(windows)
+                && std::env::var("PATHEXT").is_ok_and(|v| {
+                    v.split(';')
+                        .any(|x| x.trim_start_matches('.').eq_ignore_ascii_case(&e))
+                }))
+    })
+}
+
+fn runs(p: &std::path::Path) -> bool {
+    if launcher(p) || std::fs::canonicalize(p).is_ok_and(|c| launcher(&c)) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(windows))]
+fn uri(b: &[u8]) -> String {
+    let mut o = String::from("file://");
+    for &c in b {
+        if c.is_ascii_alphanumeric() || matches!(c, b'/' | b'-' | b'.' | b'_' | b'~') {
+            o.push(c as char);
+        } else {
+            o.push_str(&format!("%{c:02X}"));
+        }
+    }
+    o
+}
+
+fn quiet(c: &mut Command) -> &mut Command {
+    c.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+}
+
+fn reveal(path: &str) {
+    if cfg!(target_os = "macos") {
+        let mut c = Command::new("open");
+        c.args(["-R", path]);
+        quiet(&mut c);
+        detach(&mut c);
+        return;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut c = Command::new("explorer");
+        c.raw_arg(format!("/select,\"{}\"", path.replace('/', "\\")));
+        quiet(&mut c);
+        detach(&mut c);
+    }
+    #[cfg(not(windows))]
+    {
+        let p = std::path::Path::new(path);
+        let up = p
+            .parent()
+            .map(|d| d.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let Some(d) = which("dbus-send") else {
+            open_dir(&up);
+            return;
+        };
+        let mut c = Command::new(d);
+        c.args([
+            "--session",
+            "--print-reply",
+            "--reply-timeout=5000",
+            "--dest=org.freedesktop.FileManager1",
+            "--type=method_call",
+            "/org/freedesktop/FileManager1",
+            "org.freedesktop.FileManager1.ShowItems",
+            &format!("array:string:{}", uri(p.as_os_str().as_encoded_bytes())),
+            "string:",
+        ]);
+        quiet(&mut c);
+        std::thread::spawn(move || {
+            if !c.status().is_ok_and(|s| s.success()) {
+                open_dir(&up);
+            }
+        });
+    }
 }
 
 /// Starts an opener and waits for it on a thread, so a finished opener (xdg-open exits once
@@ -980,7 +1162,6 @@ mod tests {
         // a path that holds `{line}` itself is not filled in
         assert_eq!(open_cmd("ed {}", "/t/{line}", "3"), ["ed", "/t/{line}"]);
     }
-}
 
     #[test]
     fn remote_paths_are_never_stat() {
@@ -1017,3 +1198,67 @@ mod tests {
         assert_eq!(share("//host/share/a/b").as_deref(), Some("host/share"));
         assert_eq!(share("/a"), None);
     }
+
+    #[test]
+    fn launchers_are_detected() {
+        let l = |s: &str| launcher(std::path::Path::new(s));
+        for p in [
+            "setup.bat",
+            "a/b/Run.EXE",
+            "x.lnk",
+            "y.url",
+            "z.ps1",
+            "c.cmd",
+            "v.vbs",
+            "w.js",
+            "Foo.app",
+            "go.command",
+            "t.tool",
+            "s.terminal",
+            "n.desktop",
+            "setup.exe.",
+            "k.jar",
+        ] {
+            assert!(l(p), "{p}");
+        }
+        for p in [
+            "src/main.rs",
+            "README.md",
+            "a.txt",
+            "Makefile",
+            "photo.png",
+            "x.exe.txt",
+        ] {
+            assert!(!l(p), "{p}");
+        }
+        assert_eq!(l("tool.py"), cfg!(any(windows, target_os = "macos")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_bit_counts_as_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("noname-runs-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("plain");
+        std::fs::write(&f, "x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!runs(&f));
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(runs(&f));
+        let k = d.join("notes.md");
+        std::os::unix::fs::symlink(d.join("x.desktop"), &k).unwrap();
+        std::fs::write(d.join("x.desktop"), "x").unwrap();
+        assert!(runs(&k));
+        assert!(!runs(&d));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn reveal_uri_is_escaped() {
+        assert_eq!(uri(b"/a b/c,d.sh"), "file:///a%20b/c%2Cd.sh");
+        assert_eq!(uri("/ä".as_bytes()), "file:///%C3%A4");
+    }
+
+}
