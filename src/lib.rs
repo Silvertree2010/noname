@@ -672,6 +672,7 @@ pub struct App {
     uk: bool,
     unre: bool,
     drf: Option<String>,
+    hed: Vec<(usize, String)>,
     /// Input box geometry of the last frame as (top row, height, text width).
     pub ig: Cell<(u16, u16, usize)>,
     /// Background tasks (shells, monitors, agents, workflows).
@@ -1011,6 +1012,7 @@ impl App {
             uk: false,
             unre: false,
             drf: None,
+            hed: vec![],
             ig: Cell::new((0, 0, 0)),
             tasks: vec![],
             clip: String::new(),
@@ -1292,10 +1294,28 @@ impl App {
 
     /// Sends the input box: a background name, a `/` command or a prompt for the current engine.
     pub fn submit(&mut self) {
-        let s = self.inp.trim().to_string();
-        if s.is_empty() {
+        if self.inp.trim().is_empty() {
             return;
         }
+        let d = if self.hi.is_some() {
+            self.drf.take().filter(|d| !d.is_empty())
+        } else {
+            None
+        };
+        self.hed.clear();
+        self.submit0();
+        if let Some(d) = d {
+            if self.inp.is_empty() {
+                self.inp = d;
+                self.cur = self.nch();
+            } else if self.hist.last() != Some(&d) {
+                self.hist.push(d);
+            }
+        }
+    }
+
+    fn submit0(&mut self) {
+        let s = self.inp.trim().to_string();
         self.inp.clear();
         self.cur = 0;
         self.scr = 0;
@@ -1303,6 +1323,7 @@ impl App {
         self.ts = self.t.max(1);
         self.hist.push(s.clone());
         self.hi = None;
+        self.drf = None;
         if let Some(k) = bg::canon(&s) {
             self.setbg(Some(k));
             return;
@@ -2658,15 +2679,61 @@ impl App {
         }
     }
 
-    /// Clears the input box and keeps what was there in the history.
+    /// Clears the input box and keeps what was there in the history; while a history entry
+    /// is shown, the draft typed before browsing comes back instead.
     fn clearinp(&mut self) {
+        let h = self.hi.and_then(|i| self.hist.get(i)).cloned();
         let s = std::mem::take(&mut self.inp);
-        if self.hist.last() != Some(&s) {
+        if h.as_ref() != Some(&s) && !s.is_empty() && self.hist.last() != Some(&s) {
             self.hist.push(s);
         }
+        self.inp = if h.is_some() {
+            self.drf.take().unwrap_or_default()
+        } else {
+            String::new()
+        };
         self.hi = None;
         self.drf = None;
-        self.cur = 0
+        self.hed.clear();
+        self.cur = self.nch()
+    }
+
+    fn hgo(&mut self, j: Option<usize>) {
+        let s = std::mem::take(&mut self.inp);
+        match self.hi {
+            Some(i) => {
+                self.hed.retain(|x| x.0 != i);
+                if self.hist.get(i) != Some(&s) {
+                    self.hed.push((i, s));
+                }
+            }
+            None => self.drf = Some(s),
+        }
+        self.hi = j;
+        self.inp = match j {
+            Some(j) => self
+                .hed
+                .iter()
+                .find(|x| x.0 == j)
+                .map(|x| x.1.clone())
+                .or_else(|| self.hist.get(j).cloned())
+                .unwrap_or_default(),
+            None => {
+                self.hed.clear();
+                self.drf.take().unwrap_or_default()
+            }
+        };
+        self.cur = self.nch()
+    }
+
+    fn setinp(&mut self, t: String) {
+        if t != self.inp {
+            let o = std::mem::replace(&mut self.inp, t);
+            self.snap((o, self.cur));
+            self.red.clear();
+            self.uk = false;
+        }
+        self.cur = self.nch();
     }
 
     /// Ctrl+C as in Claude Code: the first press interrupts a running turn or clears the
@@ -3067,25 +3134,19 @@ impl App {
                 }
                 let i = match self.hi {
                     None => {
-                        self.drf = Some(self.inp.clone());
+                        if !self.inp.is_empty() {
+                            self.snap((self.inp.clone(), self.cur));
+                            self.red.clear();
+                        }
                         self.hist.len() - 1
                     }
                     Some(i) => i.saturating_sub(1),
                 };
-                self.hi = Some(i);
-                self.inp = self.hist[i].clone();
-                self.cur = self.nch()
+                self.hgo(Some(i));
             }
             KeyCode::Down => {
                 if let Some(i) = self.hi {
-                    if i + 1 < self.hist.len() {
-                        self.hi = Some(i + 1);
-                        self.inp = self.hist[i + 1].clone();
-                    } else {
-                        self.hi = None;
-                        self.inp = self.drf.take().unwrap_or_default();
-                    }
-                    self.cur = self.nch()
+                    self.hgo((i + 1 < self.hist.len()).then_some(i + 1));
                 }
             }
             KeyCode::PageUp => self.scr = (self.scr + 10).min(self.smax.get()),
@@ -4145,8 +4206,7 @@ fn lp<T: V>(term: &mut Terminal<CrosstermBackend<io::Stdout>>, v: &mut T) -> io:
         if a.edit {
             a.edit = false;
             if let Some(t) = editor(&a.inp) {
-                a.inp = t.trim_end_matches('\n').to_string();
-                a.cur = a.inp.chars().count();
+                a.setinp(t.trim_end_matches('\n').to_string());
             }
             term.clear()?;
             pv = None;
@@ -5412,6 +5472,92 @@ mod fix_tests {
             selhl(&mut b, Some((0, 0, 3, 2)), None);
             assert_eq!(seltext(&b, (0, 0, 3, 2)), "");
         }
+    }
+
+    fn kc(a: &mut App, c: KeyCode) {
+        a.key(KeyEvent::new(c, Km::NONE));
+    }
+
+    fn typ(a: &mut App, s: &str) {
+        for c in s.chars() {
+            kc(a, KeyCode::Char(c));
+        }
+    }
+
+    fn happ() -> App {
+        let mut a = App::new();
+        a.hist = vec!["one".into(), "two".into()];
+        a
+    }
+
+    #[test]
+    fn esc_out_of_history_restores_the_draft() {
+        let mut a = happ();
+        typ(&mut a, "draft");
+        kc(&mut a, KeyCode::Up);
+        assert_eq!(a.inp, "two");
+        kc(&mut a, KeyCode::Esc);
+        assert_eq!((a.inp.as_str(), a.cur), ("draft", 5));
+        assert_eq!(a.hist, ["one", "two"]);
+        kc(&mut a, KeyCode::Up);
+        a.key(KeyEvent::new(KeyCode::Char('c'), Km::CONTROL));
+        assert_eq!(a.inp, "draft");
+        assert!(!a.quit);
+    }
+
+    #[test]
+    fn down_past_newest_and_undo_restore_the_draft() {
+        let mut a = happ();
+        typ(&mut a, "draft");
+        kc(&mut a, KeyCode::Up);
+        kc(&mut a, KeyCode::Up);
+        assert_eq!(a.inp, "one");
+        kc(&mut a, KeyCode::Down);
+        kc(&mut a, KeyCode::Down);
+        assert_eq!(a.inp, "draft");
+        kc(&mut a, KeyCode::Up);
+        a.key(KeyEvent::new(KeyCode::Char('z'), Km::CONTROL));
+        assert_eq!(a.inp, "draft");
+    }
+
+    #[test]
+    fn submit_from_history_keeps_the_draft() {
+        let mut a = happ();
+        typ(&mut a, "draft");
+        kc(&mut a, KeyCode::Up);
+        a.submit();
+        assert_eq!(a.hist.last().map(String::as_str), Some("two"));
+        assert_eq!(a.inp, "draft");
+        a.inp.clear();
+        a.cur = 0;
+        kc(&mut a, KeyCode::Up);
+        kc(&mut a, KeyCode::Down);
+        assert_eq!(a.inp, "");
+    }
+
+    #[test]
+    fn edits_to_history_entries_survive_browsing() {
+        let mut a = happ();
+        kc(&mut a, KeyCode::Up);
+        typ(&mut a, "!");
+        assert_eq!(a.inp, "two!");
+        kc(&mut a, KeyCode::Up);
+        assert_eq!(a.inp, "one");
+        kc(&mut a, KeyCode::Down);
+        assert_eq!(a.inp, "two!");
+        kc(&mut a, KeyCode::Esc);
+        assert_eq!(a.inp, "");
+        assert_eq!(a.hist, ["one", "two", "two!"]);
+    }
+
+    #[test]
+    fn external_edit_is_one_undo_step() {
+        let mut a = App::new();
+        typ(&mut a, "abc");
+        a.setinp("xyz\nmore".into());
+        assert_eq!((a.inp.as_str(), a.cur), ("xyz\nmore", 8));
+        a.key(KeyEvent::new(KeyCode::Char('z'), Km::CONTROL));
+        assert_eq!(a.inp, "abc");
     }
 
     #[test]
