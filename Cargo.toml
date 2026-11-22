@@ -9,7 +9,7 @@ description = "A quiet terminal UI (TUI) for Claude Code, written in Rust"
 readme = "README.md"
 keywords = ["claude", "claude-code", "tui", "terminal", "ai"]
 categories = ["command-line-utilities"]
-rust-version = "1.85"
+rust-version = "1.88"
 exclude = ["assets/*", "packaging/*", ".github/*"]
 
 [features]
