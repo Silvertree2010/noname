@@ -24,6 +24,8 @@ unreachable_pub = "warn"
 [lints.clippy]
 mem_forget = "deny"
 unwrap_used = "warn"
+collapsible_if = "allow"
+manual_is_multiple_of = "allow"
 
 [dependencies]
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "underline-color"] }
