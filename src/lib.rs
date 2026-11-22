@@ -4091,6 +4091,7 @@ pub fn run<T: V + Clone>(mut v: T) -> io::Result<()> {
     if args.len() > 1 && args[1] == "--dump" {
         return dump(&mut v, &args[2..]);
     }
+    sys::on_close(bye);
     enable_raw_mode()?;
     TERM_ON.store(true, std::sync::atomic::Ordering::SeqCst);
     let mut out = io::stdout();
@@ -4196,7 +4197,6 @@ fn lp<T: V>(term: &mut Terminal<CrosstermBackend<io::Stdout>>, v: &mut T) -> io:
     let mut pv: Option<u64> = None;
     let mut sk = 0u32;
     let shot = std::env::var("NONAME_SHOT").ok();
-    sys::on_close(bye);
     sys::catch_ctrlc(true);
     upd::cleanup();
     if std::env::var("NONAME_MOCK").is_err()
@@ -4206,9 +4206,16 @@ fn lp<T: V>(term: &mut Terminal<CrosstermBackend<io::Stdout>>, v: &mut T) -> io:
     {
         a.upcheck(false);
     }
+    let st = Instant::now();
+    let mut done = 0u64;
+    let mut rz = false;
     while !a.quit {
         a.cp.set(None);
         term.autoresize()?;
+        if std::mem::take(&mut rz) {
+            term.clear()?;
+            pv = None;
+        }
         {
             let mut f = term.get_frame();
             v.draw(&mut f, &a);
@@ -4277,10 +4284,37 @@ fn lp<T: V>(term: &mut Terminal<CrosstermBackend<io::Stdout>>, v: &mut T) -> io:
             a.key(KeyEvent::new(KeyCode::Char('c'), Km::CONTROL));
         }
         let slow = sk >= 15 && !a.seld;
-        let t0 = Instant::now();
-        let dl = t0 + Duration::from_millis(if slow { 250 } else { 33 });
-        while event::poll(dl.saturating_duration_since(Instant::now()))? {
-            match event::read()? {
+        let dl = if slow {
+            Instant::now() + Duration::from_millis(250)
+        } else {
+            st + Duration::from_millis((done + 1) * 33)
+        };
+        let mut nx: VecDeque<Event> = VecDeque::new();
+        while !nx.is_empty() || event::poll(dl.saturating_duration_since(Instant::now()))? {
+            let ev = match nx.pop_front() {
+                Some(e) => e,
+                None => event::read()?,
+            };
+            #[cfg(windows)]
+            let ev = if nx.is_empty()
+                && a.rw.is_none()
+                && a.ns.is_none()
+                && a.pp.is_none()
+                && a.tp.is_none()
+                && a.bp.is_none()
+            {
+                burst(ev, &mut nx, &mut || {
+                    if event::poll(Duration::ZERO)? {
+                        event::read().map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                })?
+            } else {
+                ev
+            };
+            match ev {
+                Event::Resize(..) => rz = true,
                 Event::Key(k) if k.kind != KeyEventKind::Release => {
                     let k = altgr(k);
                     a.dn = false;
@@ -4438,7 +4472,7 @@ fn lp<T: V>(term: &mut Terminal<CrosstermBackend<io::Stdout>>, v: &mut T) -> io:
                 },
                 _ => {}
             }
-            if a.quit || slow {
+            if a.quit || ((slow || rz) && nx.is_empty()) {
                 break;
             }
         }
@@ -4464,9 +4498,11 @@ fn lp<T: V>(term: &mut Terminal<CrosstermBackend<io::Stdout>>, v: &mut T) -> io:
                 a.bgw = bg::canon(v[(a.t / 30) as usize % v.len()]);
             }
         }
-        for _ in 0..(t0.elapsed().as_millis() / 33).clamp(1, 10) {
+        let due = (st.elapsed().as_millis() / 33) as u64;
+        for _ in 0..due.saturating_sub(done).min(10) {
             a.step();
         }
+        done = due;
         if std::env::var("NONAME_MOCK").is_err() {
             let sid = a.session_id();
             if let Ok(mut s) = SID.lock() {
@@ -4485,6 +4521,60 @@ fn lp<T: V>(term: &mut Terminal<CrosstermBackend<io::Stdout>>, v: &mut T) -> io:
     } else {
         a.session_id()
     })
+}
+
+#[cfg(any(windows, test))]
+fn burst(
+    e: Event,
+    nx: &mut VecDeque<Event>,
+    more: &mut dyn FnMut() -> io::Result<Option<Event>>,
+) -> io::Result<Event> {
+    let Some(Some(c)) = pkey(&e) else {
+        return Ok(e);
+    };
+    let mut s = String::from(c);
+    let mut n = 1;
+    let mut v = vec![];
+    let mut end = None;
+    while let Some(x) = more()? {
+        match pkey(&x) {
+            Some(Some(c)) => {
+                s.push(c);
+                n += 1;
+                v.push(x);
+            }
+            Some(None) => v.push(x),
+            None => {
+                end = Some(x);
+                break;
+            }
+        }
+    }
+    if n >= 3 {
+        nx.extend(end);
+        return Ok(Event::Paste(s));
+    }
+    nx.extend(v);
+    nx.extend(end);
+    Ok(e)
+}
+
+#[cfg(any(windows, test))]
+fn pkey(e: &Event) -> Option<Option<char>> {
+    let Event::Key(k) = e else { return None };
+    if k.kind == KeyEventKind::Release {
+        return Some(None);
+    }
+    let k = altgr(*k);
+    if !k.modifiers.difference(Km::SHIFT).is_empty() {
+        return None;
+    }
+    match k.code {
+        KeyCode::Char(c) => Some(Some(c)),
+        KeyCode::Enter => Some(Some('\n')),
+        KeyCode::Tab => Some(Some('\t')),
+        _ => None,
+    }
 }
 
 /// Session id for the exit message, also when noname is ended by a signal.
@@ -4741,11 +4831,7 @@ pub fn setlay(i: usize, v: usize) {
     LSET[i].store(v as u8, std::sync::atomic::Ordering::Relaxed);
     let f = sys::cfgfile("layout");
     let (k, opts) = LAYOUT[i];
-    let body = layset(
-        &std::fs::read_to_string(&f).unwrap_or_default(),
-        k,
-        opts[v],
-    );
+    let body = layset(&std::fs::read_to_string(&f).unwrap_or_default(), k, opts[v]);
     wcfg(&f, body);
 }
 
@@ -4860,6 +4946,7 @@ fn editor(s: &str) -> Option<String> {
                 "vi".into()
             }
         });
+    sys::hold_int(true);
     let _ = restore();
     let mut v = ed.split_whitespace();
     let ok = std::process::Command::new(v.next().unwrap_or("vi"))
@@ -4880,6 +4967,7 @@ fn editor(s: &str) -> Option<String> {
     );
     let _ = execute!(out, ratatui::crossterm::event::EnableBracketedPaste);
     TERM_ON.store(true, std::sync::atomic::Ordering::SeqCst);
+    sys::hold_int(false);
     let r = if ok {
         std::fs::read_to_string(&f).ok()
     } else {
@@ -5498,7 +5586,9 @@ mod fix_tests {
         wcfg(&fs, "a");
         wcfg(&fs, "b");
         assert_eq!(std::fs::read_to_string(&f).ok().as_deref(), Some("b"));
-        let n = std::fs::read_dir(d.join("sub")).map(|r| r.count()).unwrap_or(0);
+        let n = std::fs::read_dir(d.join("sub"))
+            .map(|r| r.count())
+            .unwrap_or(0);
         assert_eq!(n, 1);
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -5670,7 +5760,9 @@ mod fix_tests {
             qs: vec![Qq {
                 q: "Ready to code?".into(),
                 h: "plan".into(),
-                opts: (1..=4).map(|i| (format!("opt{i}"), String::new())).collect(),
+                opts: (1..=4)
+                    .map(|i| (format!("opt{i}"), String::new()))
+                    .collect(),
                 multi: false,
             }],
             i: 0,
@@ -5763,6 +5855,73 @@ mod fix_tests {
         a.t += QGRACE;
         typ(&mut a, "n");
         assert!(a.ask.is_none());
+    }
+
+    fn kev(c: KeyCode, rel: bool) -> Event {
+        let mut k = KeyEvent::new(c, Km::NONE);
+        if rel {
+            k.kind = KeyEventKind::Release;
+        }
+        Event::Key(k)
+    }
+
+    fn run_burst(v: Vec<Event>) -> (Event, VecDeque<Event>) {
+        let mut it = v.into_iter();
+        let e = it.next().unwrap_or(Event::FocusGained);
+        let mut nx = VecDeque::new();
+        let r = burst(e, &mut nx, &mut || Ok(it.next()));
+        (r.unwrap_or(Event::FocusLost), nx)
+    }
+
+    #[test]
+    fn key_bursts_become_one_paste() {
+        let mut v = vec![];
+        for c in "y\nno".chars() {
+            let k = if c == '\n' {
+                KeyCode::Enter
+            } else {
+                KeyCode::Char(c)
+            };
+            v.push(kev(k, false));
+            v.push(kev(k, true));
+        }
+        v.push(Event::FocusGained);
+        let (e, nx) = run_burst(v);
+        assert_eq!(e, Event::Paste("y\nno".into()));
+        assert_eq!(nx, [Event::FocusGained]);
+        let (e, nx) = run_burst(vec![
+            kev(KeyCode::Char('a'), false),
+            kev(KeyCode::Char('a'), true),
+            kev(KeyCode::Enter, false),
+        ]);
+        assert_eq!(e, kev(KeyCode::Char('a'), false));
+        assert_eq!(nx.len(), 2);
+        let (e, nx) = run_burst(vec![
+            kev(KeyCode::Up, false),
+            kev(KeyCode::Char('a'), false),
+        ]);
+        assert_eq!(e, kev(KeyCode::Up, false));
+        assert!(nx.is_empty());
+        let mut a = App::new();
+        a.bs.push(B::Ask(Ask {
+            cmd: "x".into(),
+            ans: None,
+        }));
+        a.ask = Some(0);
+        a.t = 100;
+        a.step();
+        a.t += QGRACE;
+        if let Event::Paste(s) = run_burst(vec![
+            kev(KeyCode::Char('a'), false),
+            kev(KeyCode::Enter, false),
+            kev(KeyCode::Char('b'), false),
+        ])
+        .0
+        {
+            a.paste(s);
+        }
+        assert!(a.ask.is_some());
+        assert_eq!(a.inp, "a\nb");
     }
 
     #[test]
