@@ -1186,7 +1186,7 @@ impl App {
             }
             Sp::Fin => {
                 if let Some(i) = self.ti.take() {
-                    if let B::Tl(t) = &mut self.bs[i] {
+                    if let Some(B::Tl(t)) = self.bs.get_mut(i) {
                         t.st = if self.tf { St::Err } else { St::Ok };
                         t.t1 = self.t;
                     }
@@ -1217,13 +1217,9 @@ impl App {
     }
 
     fn stream(&mut self, th: bool, c: String) {
-        match self.sb {
-            Some(i) => {
-                if let B::Th(s) | B::T(s) = &mut self.bs[i] {
-                    s.push_str(&c)
-                }
-            }
-            None => {
+        match self.sb.and_then(|i| self.bs.get_mut(i)) {
+            Some(B::Th(s) | B::T(s)) => s.push_str(&c),
+            _ => {
                 self.bs.push(if th { B::Th(c) } else { B::T(c) });
                 self.sb = Some(self.bs.len() - 1);
             }
@@ -1239,7 +1235,7 @@ impl App {
             return;
         }
         let Some(i) = self.ask.take() else { return };
-        if let B::Ask(a) = &mut self.bs[i] {
+        if let Some(B::Ask(a)) = self.bs.get_mut(i) {
             a.ans = Some(c);
         }
         if c == 'n' {
@@ -1278,14 +1274,14 @@ impl App {
         self.q.clear();
         self.wait = 0;
         if let Some(i) = self.ti.take() {
-            if let B::Tl(t) = &mut self.bs[i] {
+            if let Some(B::Tl(t)) = self.bs.get_mut(i) {
                 t.st = St::Err;
                 t.t1 = self.t;
                 t.sum = "interrupted".into();
             }
         }
         if let Some(i) = self.ask.take() {
-            if let B::Ask(a) = &mut self.bs[i] {
+            if let Some(B::Ask(a)) = self.bs.get_mut(i) {
                 a.ans = Some('n');
             }
         }
@@ -1729,6 +1725,12 @@ impl App {
                 self.ctx = 3.0;
                 self.todo.clear();
                 self.sel = None;
+                self.sb = None;
+                self.ti = None;
+                self.ask = None;
+                self.q.clear();
+                self.wait = 0;
+                self.busy = false;
             }
             "model" => {
                 self.model = (self.model + 1) % MODELS.len();
@@ -2557,18 +2559,17 @@ impl App {
         let mut o = vec![];
         for (i, l) in self.btx.borrow().iter().enumerate() {
             let cs: Vec<char> = l.chars().collect();
-            let lc: Vec<char> = cs
+            let (lc, om): (Vec<char>, Vec<usize>) = cs
                 .iter()
-                .map(|c| c.to_lowercase().next().unwrap_or(*c))
-                .collect();
+                .enumerate()
+                .flat_map(|(k, c)| c.to_lowercase().map(move |x| (x, k)))
+                .unzip();
             let mut j = 0;
             while j + q.len() <= lc.len() {
                 if lc[j..j + q.len()] == q[..] {
-                    let x: usize = cs[..j].iter().map(|c| c.width().unwrap_or(0)).sum();
-                    let w: usize = cs[j..j + q.len()]
-                        .iter()
-                        .map(|c| c.width().unwrap_or(0))
-                        .sum();
+                    let (a, b) = (om[j], om[j + q.len() - 1] + 1);
+                    let x: usize = cs[..a].iter().map(|c| c.width().unwrap_or(0)).sum();
+                    let w: usize = cs[a..b].iter().map(|c| c.width().unwrap_or(0)).sum();
                     o.push((i, x, w));
                     j += q.len();
                 } else {
@@ -4399,6 +4400,9 @@ fn selhl(
     }
     let ((y0, x0), (y1, x1)) = selnorm(s);
     let ar = b.area;
+    if ar.width == 0 || ar.height == 0 {
+        return;
+    }
     for y in y0..=y1.min(ar.height.saturating_sub(1)) {
         let xa = if y == y0 { x0 } else { 0 };
         let xb = if y == y1 {
@@ -4419,6 +4423,9 @@ fn selhl(
 fn seltext(b: &ratatui::buffer::Buffer, s: (u16, u16, u16, u16)) -> String {
     let ((y0, x0), (y1, x1)) = selnorm(s);
     let ar = b.area;
+    if ar.width == 0 || ar.height == 0 {
+        return String::new();
+    }
     let mut ls: Vec<String> = vec![];
     for y in y0..=y1.min(ar.height.saturating_sub(1)) {
         let xa = if y == y0 { x0 } else { 0 };
@@ -4450,7 +4457,7 @@ fn tidy(ls: Vec<String>) -> String {
         .iter()
         .skip(1)
         .filter(|l| !l.is_empty())
-        .map(|l| l.len() - l.trim_start().len())
+        .map(|l| l.chars().take_while(|c| c.is_whitespace()).count())
         .min()
         .unwrap_or(0);
     let mut o: Vec<String> = ls
@@ -4460,7 +4467,7 @@ fn tidy(ls: Vec<String>) -> String {
             if i == 0 {
                 l.trim_start().to_string()
             } else {
-                l.get(ind.min(l.len())..).unwrap_or("").to_string()
+                l.chars().skip(ind).collect()
             }
         })
         .collect();
@@ -5369,5 +5376,71 @@ mod fix_tests {
         let n = std::fs::read_dir(d.join("sub")).map(|r| r.count()).unwrap_or(0);
         assert_eq!(n, 1);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn tidy_counts_indent_in_chars() {
+        let ls = vec![
+            "a".to_string(),
+            "\u{3000}\u{3000}x".to_string(),
+            "  y".to_string(),
+        ];
+        assert_eq!(tidy(ls), "a\nx\ny");
+        assert_eq!(
+            tidy(vec!["a".into(), "    b".into(), "  c".into()]),
+            "a\n  b\nc"
+        );
+    }
+
+    #[test]
+    fn find_folds_case_like_the_query() {
+        let a = App::new();
+        *a.btx.borrow_mut() = vec!["xİy İ".into(), "ABC abc".into()];
+        let mut a = a;
+        a.fs = Some(("İ".into(), 0));
+        assert_eq!(a.fhits(), vec![(0, 1, 1), (0, 4, 1)]);
+        a.fs = Some(("y".into(), 0));
+        assert_eq!(a.fhits(), vec![(0, 2, 1)]);
+        a.fs = Some(("bc".into(), 0));
+        assert_eq!(a.fhits(), vec![(1, 1, 2), (1, 5, 2)]);
+    }
+
+    #[test]
+    fn selection_on_empty_buffer_does_not_panic() {
+        for (w, h) in [(0, 0), (0, 5), (5, 0)] {
+            let mut b = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, w, h));
+            selhl(&mut b, Some((0, 0, 3, 2)), None);
+            assert_eq!(seltext(&b, (0, 0, 3, 2)), "");
+        }
+    }
+
+    #[test]
+    fn mock_clear_mid_turn_resets_indexes() {
+        let mut a = App::new();
+        a.inp = "go".into();
+        a.submit();
+        for _ in 0..400 {
+            a.step();
+            if a.ti.is_some() || a.sb.is_some() {
+                break;
+            }
+        }
+        assert!(a.ti.is_some() || a.sb.is_some());
+        a.cmd("clear");
+        assert!(a.ti.is_none() && a.sb.is_none() && a.ask.is_none());
+        for _ in 0..50 {
+            a.step();
+        }
+        a.answer('y');
+        a.stop();
+        a.inp = "again".into();
+        a.submit();
+        for _ in 0..2000 {
+            a.step();
+            if a.ask.is_some() {
+                a.cmd("clear");
+                a.answer('y');
+            }
+        }
     }
 }
