@@ -87,7 +87,6 @@ pub(crate) fn tokenv_pub(c: &mut Command) {
 }
 
 fn tokenv(c: &mut Command) {
-    c.env_remove("CLAUDE_CONFIG_DIR");
     match TOK.lock().ok().and_then(|t| t.clone()) {
         Some(t) => {
             c.env("CLAUDE_CODE_OAUTH_TOKEN", t);
@@ -147,20 +146,50 @@ pub(crate) fn guard_pub(c: &mut Command) {
     guard(c);
 }
 
+#[cfg(unix)]
+fn zomb(c: &mut Child) -> Option<bool> {
+    let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let r = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            c.id() as libc::id_t,
+            &mut si,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if r != 0 {
+        return None;
+    }
+    Some(unsafe { si.si_pid() } != 0)
+}
+
+#[cfg(windows)]
+fn zomb(c: &mut Child) -> Option<bool> {
+    match c.try_wait() {
+        Ok(Some(_)) => Some(true),
+        Ok(None) => Some(false),
+        Err(_) => None,
+    }
+}
+
+pub(crate) fn exited(c: &mut Child) -> bool {
+    zomb(c) != Some(false)
+}
+
 fn reap(c: &mut Child) {
-    if let Ok(mut k) = KIDS.lock() {
-        k.retain(|x| *x != c.id() as i32);
-    }
-    // already waited for: its pid may belong to another process by now, so send nothing
-    if matches!(c.try_wait(), Ok(Some(_))) {
-        return;
-    }
-    crate::sys::term(c.id() as i32);
-    for _ in 0..20 {
-        if matches!(c.try_wait(), Ok(Some(_))) {
-            return;
+    untrack_pid(c.id() as i32);
+    match zomb(c) {
+        None => return,
+        Some(false) => {
+            crate::sys::term(c.id() as i32);
+            for _ in 0..20 {
+                if zomb(c) != Some(false) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        Some(true) => {}
     }
     crate::sys::kill(c.id() as i32);
     let _ = c.wait();
@@ -628,11 +657,39 @@ pub(crate) fn pdir_pub(cwd: &str) -> String {
 fn pdir(cwd: &str) -> String {
     let base = std::env::var("CLAUDE_CONFIG_DIR")
         .unwrap_or_else(|_| format!("{}/.claude", crate::sys::home()));
-    let esc: String = cwd
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+    format!("{base}/projects/{}", esc(cwd))
+}
+
+fn esc(cwd: &str) -> String {
+    let u: Vec<u16> = cwd.encode_utf16().collect();
+    let e: String = u
+        .iter()
+        .map(|&c| match char::from_u32(c as u32) {
+            Some(c) if c.is_ascii_alphanumeric() => c,
+            _ => '-',
+        })
         .collect();
-    format!("{base}/projects/{esc}")
+    if e.len() <= 200 {
+        return e;
+    }
+    let h = u.iter().fold(0i32, |h, &c| {
+        (h << 5).wrapping_sub(h).wrapping_add(c as i32)
+    });
+    format!("{}-{}", &e[..200], b36((h as i64).unsigned_abs()))
+}
+
+fn b36(mut n: u64) -> String {
+    let d = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut o = vec![];
+    loop {
+        o.push(d[(n % 36) as usize]);
+        n /= 36;
+        if n == 0 {
+            break;
+        }
+    }
+    o.reverse();
+    String::from_utf8(o).unwrap_or_default()
 }
 
 fn newest(cwd: &str) -> Option<String> {
