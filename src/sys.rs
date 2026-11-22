@@ -488,7 +488,7 @@ pub fn exists(p: &str) -> bool {
         if m.len() > 4096 {
             m.clear();
         }
-        let e = resolve(p).exists();
+        let e = !remote(p) && stat(resolve(p)).unwrap_or(false);
         m.insert(p.to_string(), (e, now));
         e
     })
@@ -497,6 +497,95 @@ pub fn exists(p: &str) -> bool {
 /// Opens a folder in a new file manager window (on GNOME a new Files window, even
 /// when one is already open).
 pub fn open_dir(path: &str) {
+const AUTO: [&str; 6] = ["/net", "/network", "/afs", "/misc", "/smb", "/nfs"];
+
+fn norm(p: &std::path::Path) -> String {
+    let mut o = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                o.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => o.push(c),
+        }
+    }
+    o.to_string_lossy().replace('\\', "/").to_lowercase()
+}
+
+fn share(s: &str) -> Option<String> {
+    let r = s.strip_prefix("//")?;
+    Some(r.split('/').take(2).collect::<Vec<_>>().join("/"))
+}
+
+fn remote(p: &str) -> bool {
+    let t = p.replace('\\', "/");
+    if t.starts_with("//") {
+        return true;
+    }
+    let s = norm(&resolve(p));
+    if AUTO
+        .iter()
+        .any(|r| s == *r || s.strip_prefix(r).is_some_and(|x| x.starts_with('/')))
+    {
+        return true;
+    }
+    let Some(h) = share(&s) else { return false };
+    let own = |b: PathBuf| share(&norm(&b)).as_ref() == Some(&h);
+    !(own(std::env::current_dir().unwrap_or_default()) || own(PathBuf::from(home())))
+}
+
+type Rq = (PathBuf, std::sync::mpsc::Sender<bool>);
+type Sw = (
+    Option<std::sync::mpsc::Sender<Rq>>,
+    Option<std::sync::mpsc::Receiver<bool>>,
+);
+
+thread_local! {
+    static ST: std::cell::RefCell<Sw> = Default::default();
+}
+
+fn stat(p: PathBuf) -> Option<bool> {
+    use std::sync::mpsc;
+    ST.with(|s| {
+        let mut s = s.borrow_mut();
+        if let Some(r) = &s.1 {
+            if r.try_recv() == Err(mpsc::TryRecvError::Empty) {
+                return None;
+            }
+            s.1 = None;
+        }
+        if s.0.is_none() {
+            let (tx, rx) = mpsc::channel::<Rq>();
+            std::thread::Builder::new()
+                .name("stat".into())
+                .spawn(move || {
+                    for (p, r) in rx {
+                        let _ = r.send(p.exists());
+                    }
+                })
+                .ok()?;
+            s.0 = Some(tx);
+        }
+        let (tx, rx) = mpsc::channel();
+        if s.0.as_ref()?.send((p, tx)).is_err() {
+            s.0 = None;
+            return None;
+        }
+        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(e) => Some(e),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                s.1 = Some(rx);
+                None
+            }
+            Err(_) => {
+                s.0 = None;
+                None
+            }
+        }
+    })
+}
+
     let mut c = if cfg!(target_os = "macos") {
         let mut c = Command::new("open");
         c.arg(path);
@@ -892,3 +981,39 @@ mod tests {
         assert_eq!(open_cmd("ed {}", "/t/{line}", "3"), ["ed", "/t/{line}"]);
     }
 }
+
+    #[test]
+    fn remote_paths_are_never_stat() {
+        for p in [
+            "//host/share/x",
+            "\\\\host\\share",
+            "\\\\?\\UNC\\host\\s",
+            "//?/C:/x",
+        ] {
+            assert!(remote(p), "{p}");
+            assert!(!exists(p), "{p}");
+        }
+        #[cfg(unix)]
+        for p in [
+            "/net/host/x",
+            "/Network/Servers/h",
+            "/afs/cell/x",
+            "/net",
+            "/tmp/../net/host",
+        ] {
+            assert!(remote(p), "{p}");
+            assert!(!exists(p), "{p}");
+        }
+        for p in [
+            "/tmp/x",
+            "src/main.rs",
+            "/network-tools/a",
+            "~/x",
+            "/netx/a",
+        ] {
+            assert!(!remote(p), "{p}");
+        }
+        assert!(exists("src/sys.rs"));
+        assert_eq!(share("//host/share/a/b").as_deref(), Some("host/share"));
+        assert_eq!(share("/a"), None);
+    }
