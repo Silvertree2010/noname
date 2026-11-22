@@ -19,6 +19,21 @@ pub fn tmp_write(name: &str, b: &[u8]) -> Option<PathBuf> {
     Some(f)
 }
 
+pub(crate) fn save(p: impl AsRef<std::path::Path>, b: impl AsRef<[u8]>) -> std::io::Result<()> {
+    use std::io::Write;
+    let p = p.as_ref();
+    let mut n = p.as_os_str().to_owned();
+    n.push(format!(".{}.tmp", std::process::id()));
+    let t = PathBuf::from(n);
+    let r = std::fs::File::create(&t)
+        .and_then(|mut f| f.write_all(b.as_ref()).and_then(|_| f.sync_all()))
+        .and_then(|_| std::fs::rename(&t, p));
+    if r.is_err() {
+        let _ = std::fs::remove_file(&t);
+    }
+    r
+}
+
 /// The home folder from `HOME` or `USERPROFILE`, or an empty string when neither is set.
 pub fn home() -> String {
     std::env::var("HOME")
