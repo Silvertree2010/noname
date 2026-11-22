@@ -219,10 +219,7 @@ pub mod pal {
     /// Saves the active theme's name to the theme file.
     pub fn save() {
         let f = file();
-        if let Some(d) = std::path::Path::new(&f).parent() {
-            let _ = std::fs::create_dir_all(d);
-        }
-        let _ = std::fs::write(&f, all()[cur()].name);
+        crate::wcfg(&f, all()[cur()].name);
     }
     fn c(i: usize) -> Color {
         let v = all()[cur()].c[i];
@@ -1352,10 +1349,7 @@ impl App {
         self.bgw = k;
         if self.lv.is_some() || self.cx.is_some() {
             let f = bgfile();
-            if let Some(d) = std::path::Path::new(&f).parent() {
-                let _ = std::fs::create_dir_all(d);
-            }
-            let _ = std::fs::write(&f, k.unwrap_or("off"));
+            wcfg(&f, k.unwrap_or("off"));
         }
     }
 
@@ -1581,10 +1575,7 @@ impl App {
     pub fn setdefmode(&mut self, i: usize) {
         if self.lv.is_some() || self.cx.is_some() {
             let f = modefile();
-            if let Some(d) = std::path::Path::new(&f).parent() {
-                let _ = std::fs::create_dir_all(d);
-            }
-            let _ = std::fs::write(&f, MODES[i]);
+            wcfg(&f, MODES[i]);
         }
         if self.mode != i {
             self.mode = i;
@@ -1627,10 +1618,7 @@ impl App {
             return;
         }
         let f = sys::cfgfile("opacity");
-        if let Some(d) = std::path::Path::new(&f).parent() {
-            let _ = std::fs::create_dir_all(d);
-        }
-        let _ = std::fs::write(&f, v.to_string());
+        wcfg(&f, v.to_string());
         let sc = sys::opacity_scope();
         self.toast(if v == 100 || sc.is_empty() {
             format!("opacity  {v}%")
@@ -4504,29 +4492,40 @@ pub fn bars() -> [bool; 3] {
     use std::sync::atomic::Ordering::Relaxed;
     let mut m = BSET.load(Relaxed);
     if m == u8::MAX {
-        let hid = std::fs::read_to_string(sys::cfgfile("bars")).unwrap_or_default();
-        m = (0..3)
-            .filter(|&i| !hid.split([',', '\n', ' ']).any(|x| x.trim() == BKEY[i]))
-            .fold(0, |a, i| a | 1 << i);
+        m = bmask(&std::fs::read_to_string(sys::cfgfile("bars")).unwrap_or_default());
         BSET.store(m, Relaxed);
     }
     [m & 1 != 0, m & 2 != 0, m & 4 != 0]
 }
 
+fn bmask(hid: &str) -> u8 {
+    (0..3)
+        .filter(|&i| !hid.split([',', '\n', ' ']).any(|x| x.trim() == BKEY[i]))
+        .fold(0, |a, i| a | 1 << i)
+}
+
+fn hidset(cur: &str, k: &str, on: bool) -> String {
+    let mut v: Vec<&str> = cur
+        .split([',', '\n', ' '])
+        .map(str::trim)
+        .filter(|x| !x.is_empty() && *x != k)
+        .collect();
+    if !on {
+        v.push(k);
+    }
+    v.join(",")
+}
+
 /// Turns footer bar `i` on or off and saves the choice.
 pub fn setbar(i: usize, on: bool) {
-    let mut b = bars();
-    b[i] = on;
-    BSET.store(
-        (0..3).filter(|&j| b[j]).fold(0, |a, j| a | 1 << j),
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    let hid: Vec<&str> = (0..3).filter(|&j| !b[j]).map(|j| BKEY[j]).collect();
     let f = sys::cfgfile("bars");
-    if let Some(d) = std::path::Path::new(&f).parent() {
-        let _ = std::fs::create_dir_all(d);
-    }
-    let _ = std::fs::write(&f, hid.join(","));
+    let hid = hidset(
+        &std::fs::read_to_string(&f).unwrap_or_default(),
+        BKEY[i],
+        on,
+    );
+    BSET.store(bmask(&hid), std::sync::atomic::Ordering::Relaxed);
+    wcfg(&f, hid);
 }
 
 /// Layout settings as (name, choices), indexed as in `lay`; the first choice is the default.
@@ -4571,9 +4570,11 @@ static LSET: [std::sync::atomic::AtomicU8; 6] =
     [const { std::sync::atomic::AtomicU8::new(u8::MAX) }; 6];
 
 fn layload() -> Vec<(String, String)> {
-    std::fs::read_to_string(sys::cfgfile("layout"))
-        .unwrap_or_default()
-        .lines()
+    laypairs(&std::fs::read_to_string(sys::cfgfile("layout")).unwrap_or_default())
+}
+
+fn laypairs(s: &str) -> Vec<(String, String)> {
+    s.lines()
         .filter_map(|l| l.split_once('='))
         .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
         .collect()
@@ -4596,17 +4597,33 @@ pub fn lay(i: usize) -> usize {
     v
 }
 
-/// Chooses option `v` for layout setting `i` and saves all layout settings.
+fn layset(cur: &str, k: &str, v: &str) -> String {
+    let mut kv = laypairs(cur);
+    match kv.iter_mut().find(|x| x.0 == k) {
+        Some(x) => x.1 = v.to_string(),
+        None => kv.push((k.to_string(), v.to_string())),
+    }
+    kv.iter().map(|(k, v)| format!("{k}={v}\n")).collect()
+}
+
+/// Chooses option `v` for layout setting `i` and saves it, keeping the other saved layout settings.
 pub fn setlay(i: usize, v: usize) {
     LSET[i].store(v as u8, std::sync::atomic::Ordering::Relaxed);
-    let body: String = (0..LAYOUT.len())
-        .map(|j| format!("{}={}\n", LAYOUT[j].0, LAYOUT[j].1[lay(j)]))
-        .collect();
     let f = sys::cfgfile("layout");
-    if let Some(d) = std::path::Path::new(&f).parent() {
+    let (k, opts) = LAYOUT[i];
+    let body = layset(
+        &std::fs::read_to_string(&f).unwrap_or_default(),
+        k,
+        opts[v],
+    );
+    wcfg(&f, body);
+}
+
+fn wcfg(f: &str, b: impl AsRef<[u8]>) {
+    if let Some(d) = std::path::Path::new(f).parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    let _ = std::fs::write(&f, body);
+    let _ = sys::save(f, b);
 }
 
 /// Path of the file that stores the default permission mode.
@@ -4645,10 +4662,7 @@ pub fn rclick() -> bool {
 pub fn setrclick(on: bool) {
     RCLICK.store(on as u8, std::sync::atomic::Ordering::Relaxed);
     let f = sys::cfgfile("rclick");
-    if let Some(d) = std::path::Path::new(&f).parent() {
-        let _ = std::fs::create_dir_all(d);
-    }
-    let _ = std::fs::write(&f, if on { "on" } else { "off" });
+    wcfg(&f, if on { "on" } else { "off" });
 }
 
 /// The saved default effort, or `None` to leave it to Claude.
@@ -4662,10 +4676,7 @@ pub fn setdefeff(e: Option<&str>) {
     let f = sys::cfgfile("effort");
     match e {
         Some(e) => {
-            if let Some(d) = std::path::Path::new(&f).parent() {
-                let _ = std::fs::create_dir_all(d);
-            }
-            let _ = std::fs::write(&f, e);
+            wcfg(&f, e);
         }
         None => {
             let _ = std::fs::remove_file(&f);
@@ -5324,5 +5335,39 @@ mod md_tests {
     fn short_code_lines_stay_whole() {
         let ls = md("```\n  let x = 1;\n\n```", 80, &mdt());
         assert_eq!(text(&ls[0]), "  |   let x = 1;");
+    }
+}
+
+#[cfg(test)]
+mod fix_tests {
+    use super::*;
+
+    #[test]
+    fn setting_writes_keep_other_keys() {
+        assert_eq!(
+            layset("input=top\nmodel=off\n", "model", "bottom"),
+            "input=top\nmodel=bottom\n"
+        );
+        assert_eq!(
+            layset("input=top\n", "title", "top left"),
+            "input=top\ntitle=top left\n"
+        );
+        assert_eq!(hidset("5h", "week", false), "5h,week");
+        assert_eq!(hidset("5h,week", "5h", true), "week");
+        assert_eq!(hidset("", "context", true), "");
+        assert_eq!(bmask("5h,week"), 1);
+    }
+
+    #[test]
+    fn wcfg_writes_atomically() {
+        let d = std::env::temp_dir().join(format!("noname-wcfg-{}", std::process::id()));
+        let f = d.join("sub").join("x");
+        let fs = f.to_string_lossy().to_string();
+        wcfg(&fs, "a");
+        wcfg(&fs, "b");
+        assert_eq!(std::fs::read_to_string(&f).ok().as_deref(), Some("b"));
+        let n = std::fs::read_dir(d.join("sub")).map(|r| r.count()).unwrap_or(0);
+        assert_eq!(n, 1);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
