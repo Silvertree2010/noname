@@ -20,6 +20,9 @@ pub(crate) struct Lv {
     bm: HashMap<u64, usize>,
     areq: Option<(String, Value, Value)>,
     pq: VecDeque<Value>,
+    dead: bool,
+    ld: String,
+    lb: usize,
     sid: String,
     args: Vec<String>,
     brx: Option<Receiver<Value>>,
@@ -261,18 +264,78 @@ fn spawn(args: &[String]) -> io::Result<(Child, ChildStdin, Receiver<Value>)> {
     Ok((c, i, rx))
 }
 
-/// `args` with any `--model` dropped and `--model v` added at the end.
-fn with_model(args: &[String], v: &str) -> Vec<String> {
+fn with_opt(args: &[String], n: &str, v: &str) -> Vec<String> {
     let mut o = vec![];
     let mut it = args.iter();
     while let Some(x) = it.next() {
-        if x == "--model" {
+        if x == n {
             it.next();
-        } else if !x.starts_with("--model=") {
+        } else if !x.strip_prefix(n).is_some_and(|r| r.starts_with('=')) {
             o.push(x.clone());
         }
     }
-    o.extend(["--model".into(), v.into()]);
+    o.extend([n.into(), v.into()]);
+    o
+}
+
+fn with_model(args: &[String], v: &str) -> Vec<String> {
+    with_opt(args, "--model", v)
+}
+
+fn with_mode(args: &[String], m: &str) -> Vec<String> {
+    let a: Vec<String> = args
+        .iter()
+        .filter(|x| *x != "--dangerously-skip-permissions")
+        .cloned()
+        .collect();
+    with_opt(&a, "--permission-mode", m)
+}
+
+fn fval(args: &[String], ns: &[&str]) -> Option<String> {
+    let mut r = None;
+    for (i, x) in args.iter().enumerate() {
+        for n in ns {
+            if x == n {
+                r = Some(
+                    args.get(i + 1)
+                        .filter(|v| !v.starts_with('-'))
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+            } else if let Some(v) = x.strip_prefix(n).and_then(|v| v.strip_prefix('=')) {
+                r = Some(v.to_string());
+            }
+        }
+    }
+    r
+}
+
+fn resumes(args: &[String]) -> bool {
+    fval(args, &["-r", "--resume", "-c", "--continue"]).is_some()
+}
+
+fn fresh(args: &[String]) -> Vec<String> {
+    let mut o = vec![];
+    let mut it = args.iter().peekable();
+    while let Some(x) = it.next() {
+        let (n, eq) = match x.split_once('=') {
+            Some((n, _)) if n.starts_with('-') => (n, true),
+            _ => (x.as_str(), false),
+        };
+        match n {
+            "-c" | "--continue" | "--fork-session" => {}
+            "-r" | "--resume" if !eq => {
+                if it.peek().is_some_and(|v| !v.starts_with('-')) {
+                    it.next();
+                }
+            }
+            "--session-id" | "--resume-session-at" if !eq => {
+                it.next();
+            }
+            "-r" | "--resume" | "--session-id" | "--resume-session-at" => {}
+            _ => o.push(x.clone()),
+        }
+    }
     o
 }
 
@@ -709,6 +772,35 @@ fn newest(cwd: &str) -> Option<String> {
     v.pop().map(|x| x.1)
 }
 
+fn rerr(e: &Value) -> Option<String> {
+    let st = sv(e, "subtype");
+    let es: Vec<String> = e["errors"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|x| {
+                    x.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| x.to_string())
+                })
+                .filter(|x| !x.trim().is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let kind = st.strip_prefix("error_").unwrap_or(&st).replace('_', " ");
+    if !es.is_empty() {
+        Some(format!("{kind}: {}", one(&es.join("; "), 300)))
+    } else if st.starts_with("error") || e["is_error"] == true {
+        Some(if kind.is_empty() {
+            "error".into()
+        } else {
+            kind
+        })
+    } else {
+        None
+    }
+}
+
 fn rtext(c: &Value) -> String {
     match c.get("content") {
         Some(Value::String(s)) => s.clone(),
@@ -788,6 +880,9 @@ impl App {
             bm: HashMap::new(),
             areq: None,
             pq: VecDeque::new(),
+            dead: false,
+            ld: String::new(),
+            lb: 0,
             sid: String::new(),
             args,
             brx: None,
@@ -803,9 +898,9 @@ impl App {
         a.ctrl("init", init());
         let ar = a.lv.as_ref().map(|l| l.args.clone()).unwrap_or_default();
         let cwd = std::env::current_dir()?.to_string_lossy().to_string();
-        let rid = if let Some(i) = ar.iter().position(|x| x == "-r" || x == "--resume") {
-            ar.get(i + 1).filter(|x| !x.starts_with('-')).cloned()
-        } else if ar.iter().any(|x| x == "-c" || x == "--continue") {
+        let rid = if let Some(v) = fval(&ar, &["-r", "--resume"]) {
+            Some(v).filter(|v| !v.is_empty())
+        } else if fval(&ar, &["-c", "--continue"]).is_some() {
             newest(&cwd)
         } else {
             None
@@ -923,6 +1018,9 @@ impl App {
     }
 
     pub(crate) fn lsubmit(&mut self, s: String) {
+        if !self.revive() {
+            return;
+        }
         if !self.busy {
             self.t0 = self.t;
         }
@@ -950,19 +1048,8 @@ impl App {
         match c {
             "btw" if !arg.trim().is_empty() => self.lbtw(arg.trim()),
             "clear" | "new" => {
-                let args: Vec<String> = self
-                    .lv
-                    .as_ref()
-                    .map(|l| {
-                        l.args
-                            .iter()
-                            .filter(|x| {
-                                !matches!(x.as_str(), "-c" | "--continue" | "-r" | "--resume")
-                            })
-                            .cloned()
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let args: Vec<String> =
+                    self.lv.as_ref().map(|l| fresh(&l.args)).unwrap_or_default();
                 if let Ok(mut n) = App::live(args) {
                     n.tc = self.t;
                     n.t = self.t;
@@ -1015,6 +1102,9 @@ impl App {
             }
             "resume" => self.lresume(arg.trim()),
             _ => {
+                if !self.revive() {
+                    return;
+                }
                 if c == "effort" && !arg.is_empty() {
                     self.effs = arg.to_string();
                 }
@@ -1220,18 +1310,7 @@ impl App {
     }
 
     pub(crate) fn lresume(&mut self, id: &str) {
-        let mut args: Vec<String> = self.lv.as_ref().map(|l| l.args.clone()).unwrap_or_default();
-        let mut o = vec![];
-        let mut it = args.drain(..);
-        while let Some(x) = it.next() {
-            match x.as_str() {
-                "-c" | "--continue" | "--fork-session" => {}
-                "-r" | "--resume" | "--resume-session-at" => {
-                    it.next();
-                }
-                _ => o.push(x),
-            }
-        }
+        let mut o: Vec<String> = self.lv.as_ref().map(|l| fresh(&l.args)).unwrap_or_default();
         o.extend(["--resume".into(), id.to_string()]);
         match App::live(o) {
             Ok(mut n) => {
@@ -1247,6 +1326,9 @@ impl App {
 
     pub(crate) fn lmode(&mut self) {
         let m = PM[self.mode];
+        if let Some(l) = &mut self.lv {
+            l.args = with_mode(&l.args, m);
+        }
         self.ctrl("pm", json!({"subtype": "set_permission_mode", "mode": m}));
     }
 
@@ -1269,7 +1351,51 @@ impl App {
             }
         }
         self.sb = None;
+        if self.ldead() {
+            self.busy = false;
+        }
         self.bs.push(B::Sys("interrupted".into()));
+    }
+
+    fn ldead(&mut self) -> bool {
+        self.lv
+            .as_mut()
+            .is_some_and(|l| l.dead || exited(&mut l.ch))
+    }
+
+    fn revive(&mut self) -> bool {
+        if !self.ldead() {
+            return true;
+        }
+        let sid = self.session_id();
+        if sid.is_empty() {
+            self.lcmd("clear");
+        } else {
+            self.lresume(&sid);
+        }
+        if self.ldead() {
+            self.bs.push(B::Sys(
+                "claude is not running and could not be restarted".into(),
+            ));
+            return false;
+        }
+        true
+    }
+
+    fn lgone(&mut self, why: &str) {
+        let ids: Vec<String> = self
+            .lv
+            .as_ref()
+            .map(|l| l.cms.iter().map(|c| c.tid.clone()).collect())
+            .unwrap_or_default();
+        for id in &ids {
+            self.cmend(id, why.to_string(), true);
+        }
+        let now = self.t.max(1);
+        for t in self.tasks.iter_mut().filter(|t| t.st == 0) {
+            t.st = 3;
+            t.t1 = now;
+        }
     }
 
     pub(crate) fn lqa(&mut self, q: Qa, ok: bool) {
@@ -1285,6 +1411,9 @@ impl App {
                 Some(i) if ok => {
                     self.mode = i;
                     self.tm = self.t.max(1);
+                    if let Some(l) = &mut self.lv {
+                        l.args = with_mode(&l.args, PM[i]);
+                    }
                     json!({"behavior": "allow", "updatedInput": q.inp, "updatedPermissions": [{"type": "setMode", "mode": PM[i], "destination": "session"}]})
                 }
                 _ if ok && a != "no, keep planning" => {
@@ -1706,17 +1835,37 @@ impl App {
             "system" => match e["subtype"].as_str().unwrap_or("") {
                 "init" => {
                     let sid = sv(&e, "session_id");
-                    let rs = self.lv.as_ref().is_some_and(|l| {
-                        l.sid.is_empty()
-                            && l.args.iter().any(|x| {
-                                matches!(x.as_str(), "-c" | "--continue" | "-r" | "--resume")
-                            })
-                    });
+                    let cwd = sv(&e, "cwd");
+                    let (rs, ld, lb) = self
+                        .lv
+                        .as_ref()
+                        .map(|l| {
+                            (
+                                resumes(&l.args) && !l.args.iter().any(|x| x == "--fork-session"),
+                                l.ld.clone(),
+                                l.lb,
+                            )
+                        })
+                        .unwrap_or_default();
                     if let Some(l) = &mut self.lv {
                         l.sid = sid.clone();
                     }
-                    if rs {
-                        self.load(&sid, &sv(&e, "cwd"));
+                    if rs && !sid.is_empty() && ld != sid {
+                        let ok =
+                            std::path::Path::new(&format!("{}/{sid}.jsonl", pdir(&cwd))).exists();
+                        if ok && !ld.is_empty() && self.bs.len() == lb {
+                            self.bs.clear();
+                            if let Some(l) = &mut self.lv {
+                                l.tm.clear();
+                                l.uid.clear();
+                            }
+                            self.load(&sid, &cwd);
+                        } else if ok && ld.is_empty() {
+                            self.load(&sid, &cwd);
+                        }
+                    }
+                    if let Some(l) = &mut self.lv {
+                        l.ld = sid.clone();
                     }
                     let m = sv(&e, "model");
                     if let Some(i) = MID_ALL.iter().position(|x| m.starts_with(x.0)) {
@@ -2018,11 +2167,8 @@ impl App {
                             .collect();
                     }
                     let ar = self.lv.as_ref().map(|l| l.args.clone()).unwrap_or_default();
-                    let want = ar
-                        .iter()
-                        .position(|x| x == "--model")
-                        .and_then(|i| ar.get(i + 1))
-                        .cloned()
+                    let want = fval(&ar, &["--model"])
+                        .filter(|x| !x.is_empty())
                         .unwrap_or_else(|| "default".into());
                     if let Some(ms) = p["models"].as_array() {
                         let v: Vec<(String, String, String, Vec<String>)> = ms
@@ -2261,6 +2407,10 @@ impl App {
                     .any(|b| matches!(b, B::T(_) | B::Tl(_)));
                 if (quiet || e["is_error"] == true) && !txt.trim().is_empty() {
                     self.bs.push(B::T(txt));
+                } else if txt.trim().is_empty() {
+                    if let Some(x) = rerr(&e) {
+                        self.bs.push(B::Sys(x));
+                    }
                 }
                 for b in self.bs.iter_mut() {
                     if let B::Tl(t) = b {
@@ -2297,7 +2447,18 @@ impl App {
                 self.busy = false;
                 if let Some(l) = &mut self.lv {
                     reap(&mut l.ch);
+                    l.dead = true;
+                    l.areq = None;
+                    l.pq.clear();
                 }
+                self.lgone("stopped: the Claude session ended");
+                if let Some(i) = self.ask.take() {
+                    if let Some(B::Ask(a)) = self.bs.get_mut(i) {
+                        a.ans = Some('n');
+                    }
+                }
+                self.qa = None;
+                self.sb = None;
                 self.bs.push(B::Sys("claude exited".into()));
             }
             _ => {}
@@ -2308,6 +2469,9 @@ impl App {
         let Ok(f) = std::fs::read_to_string(format!("{}/{sid}.jsonl", pdir(cwd))) else {
             return;
         };
+        if let Some(l) = &mut self.lv {
+            l.ld = sid.to_string();
+        }
         let keep = std::mem::take(&mut self.bs);
         for l in f.lines() {
             let Ok(o) = serde_json::from_str::<Value>(l) else {
@@ -2379,8 +2543,10 @@ impl App {
         self.bs
             .push(B::Sys(format!("resumed  {}", &sid[..8.min(sid.len())])));
         self.bs.extend(keep);
+        let n = self.bs.len();
         if let Some(l) = &mut self.lv {
-            l.tb = self.bs.len();
+            l.tb = n;
+            l.lb = n;
         }
     }
 
@@ -2407,20 +2573,7 @@ impl App {
         let Some(l) = &self.lv else { return };
         let u = l.uid.get(&i).cloned().unwrap_or_default();
         let sid = l.sid.clone();
-        let base: Vec<String> = {
-            let mut v = vec![];
-            let mut it = l.args.iter();
-            while let Some(x) = it.next() {
-                match x.as_str() {
-                    "-c" | "--continue" | "--fork-session" => {}
-                    "-r" | "--resume" | "--resume-session-at" => {
-                        it.next();
-                    }
-                    _ => v.push(x.clone()),
-                }
-            }
-            v
-        };
+        let base = fresh(&l.args);
         let cwd = std::env::current_dir()
             .map(|d| d.to_string_lossy().to_string())
             .unwrap_or_default();
@@ -2452,13 +2605,13 @@ impl App {
             _ => String::new(),
         };
         let cmds = l.cmds.clone();
-        let c0 = l.c0;
         let uid: HashMap<usize, String> = l
             .uid
             .iter()
             .filter(|(k, _)| **k < i)
             .map(|(k, v)| (*k, v.clone()))
             .collect();
+        self.lgone("stopped: the conversation was rewound");
         self.lv = Some(Lv {
             inp,
             rx,
@@ -2469,6 +2622,9 @@ impl App {
             bm: HashMap::new(),
             areq: None,
             pq: VecDeque::new(),
+            dead: false,
+            ld: sid.clone(),
+            lb: 0,
             sid: if par.is_empty() { String::new() } else { sid },
             args: base,
             brx: None,
@@ -2476,7 +2632,7 @@ impl App {
             tb: 0,
             uid,
             rwp: None,
-            c0,
+            c0: 0.0,
             w0: -1.0,
             cmds,
             cms: vec![],
@@ -2728,5 +2884,229 @@ mod model_tests {
             with_model(&s(&["--model", "haiku", "-c", "--model=sonnet"]), "opus"),
             s(&["-c", "--model", "opus"])
         );
+    }
+}
+
+#[cfg(test)]
+mod arg_tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn fresh_drops_session_flags() {
+        assert_eq!(
+            fresh(&s(&[
+                "--session-id",
+                "abc",
+                "--model",
+                "opus",
+                "-r",
+                "x",
+                "--resume=y",
+                "-c",
+                "--session-id=z",
+                "--resume-session-at",
+                "u",
+                "--fork-session",
+                "--continue",
+                "-r",
+                "--verbose",
+            ])),
+            s(&["--model", "opus", "--verbose"])
+        );
+    }
+
+    #[test]
+    fn fval_reads_both_forms() {
+        let r = ["-r", "--resume"];
+        assert_eq!(fval(&s(&["--resume=abc"]), &r).as_deref(), Some("abc"));
+        assert_eq!(fval(&s(&["-r", "abc"]), &r).as_deref(), Some("abc"));
+        assert_eq!(fval(&s(&["-r", "--x"]), &r).as_deref(), Some(""));
+        assert_eq!(
+            fval(&s(&["--model=opus"]), &["--model"]).as_deref(),
+            Some("opus")
+        );
+        assert_eq!(fval(&s(&["--models"]), &["--model"]), None);
+        assert!(resumes(&s(&["--continue"])));
+        assert!(!resumes(&s(&["--model", "x"])));
+    }
+
+    #[test]
+    fn with_mode_replaces_the_mode() {
+        let a = s(&[
+            "--permission-mode",
+            "bypassPermissions",
+            "--dangerously-skip-permissions",
+            "--permission-mode=auto",
+            "-c",
+        ]);
+        assert_eq!(
+            with_mode(&a, "default"),
+            s(&["-c", "--permission-mode", "default"])
+        );
+    }
+
+    #[test]
+    fn esc_matches_claude() {
+        assert_eq!(esc("/tmp/a😀b.c"), "-tmp-a--b-c");
+        let p = format!("/home/u/{}x😀y", "verylongdirectoryname_".repeat(10));
+        let want = format!(
+            "-home-u-{}verylongdirector-s9azil",
+            "verylongdirectoryname-".repeat(8)
+        );
+        assert_eq!(esc(&p), want);
+    }
+
+    #[test]
+    fn result_errors_are_shown() {
+        let e = json!({"type": "result", "subtype": "error_max_turns", "is_error": true, "errors": ["Reached maximum number of turns (3)"]});
+        assert_eq!(
+            rerr(&e).as_deref(),
+            Some("max turns: Reached maximum number of turns (3)")
+        );
+        let e = json!({"type": "result", "subtype": "error_during_execution", "is_error": true});
+        assert_eq!(rerr(&e).as_deref(), Some("during execution"));
+        assert_eq!(rerr(&json!({"subtype": "success"})), None);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod queue_tests {
+    use super::*;
+
+    fn fake() -> (App, Child) {
+        let mut cat = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("cat runs");
+        let inp = cat.stdin.take().expect("piped");
+        let ch = Command::new("sleep").arg("30").spawn().expect("sleep runs");
+        let (_tx, rx) = channel();
+        let mut a = App::new();
+        a.lv = Some(Lv {
+            inp,
+            rx,
+            ch,
+            rid: 0,
+            tm: HashMap::new(),
+            sm: HashMap::new(),
+            bm: HashMap::new(),
+            areq: None,
+            pq: VecDeque::new(),
+            dead: false,
+            ld: String::new(),
+            lb: 0,
+            sid: String::new(),
+            args: vec![],
+            brx: None,
+            bch: None,
+            tb: 0,
+            uid: HashMap::new(),
+            rwp: None,
+            c0: 0.0,
+            w0: 0.0,
+            cmds: vec![],
+            cms: vec![],
+        });
+        (a, cat)
+    }
+
+    fn sent(mut a: App, mut cat: Child) -> Vec<Value> {
+        drop(a.lv.take());
+        let mut o = String::new();
+        if let Some(mut r) = cat.stdout.take() {
+            let _ = io::Read::read_to_string(&mut r, &mut o);
+        }
+        let _ = cat.wait();
+        o.lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    fn perm(id: &str) -> Value {
+        json!({"type": "control_request", "request_id": id, "request": {"subtype": "can_use_tool", "tool_name": "Bash", "input": {"command": "ls"}}})
+    }
+
+    fn resp(v: &[Value]) -> Vec<(String, String)> {
+        v.iter()
+            .filter(|x| x["type"] == "control_response")
+            .map(|x| {
+                (
+                    sv(&x["response"], "request_id"),
+                    sv(&x["response"]["response"], "behavior"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn overlapping_requests_are_answered_one_by_one() {
+        let (mut a, cat) = fake();
+        a.ev(perm("a"));
+        a.ev(perm("b"));
+        a.ev(json!({"type": "control_request", "request_id": "q", "request": {"subtype": "can_use_tool", "tool_name": "AskUserQuestion", "input": {"questions": [{"question": "x?", "header": "h", "options": [{"label": "1"}]}]}}}));
+        assert!(a.ask.is_some());
+        assert!(a.qa.is_none());
+        a.lanswer('y');
+        assert!(a.ask.is_some());
+        a.lanswer('n');
+        assert!(a.ask.is_none());
+        let q = a.qa.take().expect("question shown");
+        a.lqa(q, false);
+        let v = sent(a, cat);
+        assert_eq!(
+            resp(&v),
+            vec![
+                ("a".into(), "allow".into()),
+                ("b".into(), "deny".into()),
+                ("q".into(), "deny".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn cancel_and_interrupt_close_pending_requests() {
+        let (mut a, cat) = fake();
+        a.ev(perm("a"));
+        a.ev(perm("b"));
+        a.ev(perm("c"));
+        a.ev(json!({"type": "control_cancel_request", "request_id": "a"}));
+        assert!(a.ask.is_some());
+        a.ev(json!({"type": "control_cancel_request", "request_id": "c"}));
+        a.ev(perm("d"));
+        a.lstop();
+        assert!(a.ask.is_none());
+        let v = sent(a, cat);
+        assert_eq!(
+            resp(&v),
+            vec![("d".into(), "deny".into()), ("b".into(), "deny".into())]
+        );
+    }
+
+    #[test]
+    fn mode_changes_reach_the_restart_args() {
+        let (mut a, cat) = fake();
+        if let Some(l) = &mut a.lv {
+            l.args = vec!["--permission-mode".into(), "bypassPermissions".into()];
+        }
+        a.mode = 0;
+        a.lmode();
+        let ar = a.lv.as_ref().map(|l| l.args.clone()).unwrap_or_default();
+        let _ = sent(a, cat);
+        assert_eq!(ar, vec!["--permission-mode".to_string(), "default".into()]);
+    }
+
+    #[test]
+    fn dead_engine_clears_busy_on_stop() {
+        let (mut a, cat) = fake();
+        a.ev(json!({"type": "_eof"}));
+        a.busy = true;
+        a.lstop();
+        assert!(!a.busy);
+        let _ = sent(a, cat);
     }
 }
