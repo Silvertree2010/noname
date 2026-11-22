@@ -833,13 +833,14 @@ pub fn xclip_first() -> bool {
     std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty()) && which("xclip").is_some()
 }
 
-/// Puts text on the system clipboard. Returns false when no clipboard tool was found,
+/// Puts text on the system clipboard. Returns false when no clipboard tool was found or `clip` failed (Windows),
 /// so the caller can say that only the terminal's own clipboard (OSC 52) was tried.
 pub fn setclip(t: &str) -> bool {
+    if cfg!(windows) {
+        return winclip(t);
+    }
     let c: Option<(&str, &[&str])> = if cfg!(target_os = "macos") {
         Some(("pbcopy", &[]))
-    } else if cfg!(windows) {
-        None
     } else if std::env::var("WAYLAND_DISPLAY").is_ok()
         && which("wl-copy").is_some()
         && !xclip_first()
@@ -851,7 +852,7 @@ pub fn setclip(t: &str) -> bool {
         None
     };
     let Some((p, a)) = c else {
-        return cfg!(windows);
+        return false;
     };
     let Ok(mut ch) = Command::new(p)
         .args(a)
@@ -868,6 +869,30 @@ pub fn setclip(t: &str) -> bool {
     }
     std::thread::spawn(move || ch.wait());
     true
+}
+
+fn u16le(t: &str) -> Vec<u8> {
+    std::iter::once(0xfeff)
+        .chain(t.encode_utf16())
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+fn winclip(t: &str) -> bool {
+    use std::io::Write;
+    let Ok(mut ch) = Command::new("clip")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let w = ch
+        .stdin
+        .take()
+        .is_some_and(|mut i| i.write_all(&u16le(t)).is_ok());
+    ch.wait().is_ok_and(|s| s.success()) && w
 }
 
 #[derive(Clone)]
@@ -1261,4 +1286,8 @@ mod tests {
         assert_eq!(uri("/ä".as_bytes()), "file:///%C3%A4");
     }
 
+    #[test]
+    fn clip_gets_utf16_with_bom() {
+        assert_eq!(u16le("aé"), [0xff, 0xfe, b'a', 0, 0xe9, 0]);
+    }
 }
