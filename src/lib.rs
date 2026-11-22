@@ -1784,6 +1784,9 @@ impl App {
 
     /// Inserts `c` at the cursor.
     pub fn ins(&mut self, c: char) {
+        if c == PSEN {
+            return;
+        }
         self.sug = None;
         self.ms = 0;
         let i = self.bi();
@@ -2219,7 +2222,10 @@ impl App {
             self.files(v);
             return;
         }
-        let s = s.replace("\r\n", "\n").replace('\r', "\n");
+        let s = s
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace(PSEN, "");
         if self.rs.is_some() {
             self.rq.push_str(s.lines().next().unwrap_or(""));
             return;
@@ -2239,11 +2245,15 @@ impl App {
                 format!("{c} chars")
             };
             let t = format!(
-                "{}[pasted #{} {d}] ",
+                "{}[{PSEN}pasted #{} {d}] ",
                 if pre { " " } else { "" },
                 self.pst.len()
             );
-            self.put(&t);
+            let i = self.bi();
+            self.inp.insert_str(i, &t);
+            self.cur += t.chars().count();
+            self.sug = None;
+            self.ms = 0;
             return;
         }
         self.put(&s);
@@ -2274,7 +2284,7 @@ impl App {
     pub fn expand(&self, s: &str) -> String {
         let mut o = String::new();
         let mut r = s;
-        while let Some(i) = r.find("[pasted #") {
+        while let Some(i) = r.find(PTAG) {
             o.push_str(&r[..i]);
             let t = &r[i..];
             match ptok(t) {
@@ -3310,7 +3320,7 @@ fn tokend(cs: &[char]) -> Option<usize> {
 
 /// Reads a `[pasted #N]` token at the start of `s` as (N, length in characters).
 pub fn ptok(s: &str) -> Option<(usize, usize)> {
-    let r = s.strip_prefix("[pasted #")?;
+    let r = s.strip_prefix(PTAG)?;
     let d: String = r.chars().take_while(|c| c.is_ascii_digit()).collect();
     if d.is_empty() {
         return None;
@@ -3322,8 +3332,11 @@ pub fn ptok(s: &str) -> Option<(usize, usize)> {
     if r[d.len()..].chars().nth(e) != Some(']') {
         return None;
     }
-    Some((d.parse().ok()?, 9 + d.len() + e + 1))
+    Some((d.parse().ok()?, PTAG.chars().count() + d.len() + e + 1))
 }
+
+const PSEN: char = '\u{2060}';
+const PTAG: &str = "[\u{2060}pasted #";
 
 /// Reads an image or pasted token at the start of `s` as (N, length in characters).
 pub fn atok(s: &str) -> Option<(usize, usize)> {
@@ -3351,7 +3364,7 @@ pub fn imgspans(s: &str, base: Style, hi: Style) -> Vec<Span<'static>> {
                 v.push(Span::styled(std::mem::take(&mut cur), base));
             }
             let b: usize = rest.chars().take(l).map(char::len_utf8).sum();
-            v.push(Span::styled(rest[..b].to_string(), hi));
+            v.push(Span::styled(rest[..b].replace(PSEN, ""), hi));
             rest = &rest[b..];
         } else {
             let Some(c) = rest.chars().next() else { break };
@@ -4538,9 +4551,10 @@ fn tidy(ls: Vec<String>) -> String {
 }
 
 fn copy(t: &str) -> bool {
+    let t = t.replace(PSEN, "");
     let _ = write!(io::stdout(), "\x1b]52;c;{}\x07", img::b64(t.as_bytes()));
     let _ = io::stdout().flush();
-    sys::setclip(t)
+    sys::setclip(&t)
 }
 
 fn cur_label(q: &Option<Qa>, j: usize) -> String {
@@ -5558,6 +5572,44 @@ mod fix_tests {
         assert_eq!((a.inp.as_str(), a.cur), ("xyz\nmore", 8));
         a.key(KeyEvent::new(KeyCode::Char('z'), Km::CONTROL));
         assert_eq!(a.inp, "abc");
+    }
+
+    #[test]
+    fn only_real_paste_tokens_expand() {
+        let mut a = App::new();
+        let big: String = (0..10).map(|i| format!("l{i}\n")).collect();
+        a.paste(big.clone());
+        typ(&mut a, "and [pasted #1 +10 lines] literal");
+        let x = a.expand(&a.inp);
+        assert_eq!(x.matches("l9").count(), 1);
+        assert!(x.contains("[pasted #1 +10 lines] literal"));
+        assert!(x.starts_with(&big));
+        let shown: String = imgspans(&a.inp, Style::default(), Style::default())
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(!shown.contains(PSEN));
+        let n = a.inp.chars().count();
+        a.paste(a.inp.clone());
+        assert_eq!(a.expand(&a.inp).matches("l9").count(), 1);
+        assert_eq!(a.inp.chars().count(), 2 * n - 1);
+        a.inp.clear();
+        a.cur = 0;
+        a.key(KeyEvent::new(KeyCode::Char(PSEN), Km::NONE));
+        typ(&mut a, "[pasted #1 x]");
+        assert_eq!(a.expand(&a.inp), "[pasted #1 x]");
+        assert_eq!(a.tokl(), None);
+    }
+
+    #[test]
+    fn paste_token_is_one_unit_for_the_cursor() {
+        let mut a = App::new();
+        a.paste("a\nb\nc\nd\ne\nf".into());
+        let t = a.inp.trim_end().to_string();
+        assert_eq!(ptok(&t).map(|x| x.1), Some(t.chars().count()));
+        kc(&mut a, KeyCode::Left);
+        kc(&mut a, KeyCode::Backspace);
+        assert_eq!(a.inp, " ");
     }
 
     #[test]
