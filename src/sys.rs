@@ -716,16 +716,17 @@ fn launcher(p: &std::path::Path) -> bool {
 }
 
 fn runs(p: &std::path::Path) -> bool {
-    if launcher(p) || std::fs::canonicalize(p).is_ok_and(|c| launcher(&c)) {
-        return true;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0) {
-            return true;
-        }
-    }
+    launcher(p) || std::fs::canonicalize(p).is_ok_and(|c| launcher(&c)) || exe_bit(p)
+}
+
+#[cfg(unix)]
+fn exe_bit(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn exe_bit(_: &std::path::Path) -> bool {
     false
 }
 
