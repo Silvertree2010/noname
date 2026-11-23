@@ -2,7 +2,7 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -56,11 +56,10 @@ fn uuid() -> String {
     )
 }
 
-const STRIP: [&str; 14] = [
+const STRIP: [&str; 13] = [
     "CLAUDECODE",
     "CLAUDE_PID",
     "CLAUDE_EFFORT",
-    "CLAUDE_CONFIG_DIR",
     "CLAUDE_CODE_ENTRYPOINT",
     "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_CODE_CHILD_SESSION",
@@ -113,14 +112,61 @@ pub(crate) struct Run {
     dir: PathBuf,
     sig: PathBuf,
     tr: PathBuf,
-    pos: usize,
-    part: String,
+    pos: u64,
+    part: Vec<u8>,
     pub(crate) tools: u64,
     txt: String,
     note: String,
     lp: Instant,
     sd: Option<Instant>,
     fin: bool,
+    t0: Instant,
+    seen: Instant,
+    sh: u64,
+    dlg: Option<(u8, Instant)>,
+}
+
+const LIM: Duration = Duration::from_secs(100 * 60);
+const IDLE: Duration = Duration::from_secs(10 * 60);
+const HOLD: Duration = Duration::from_secs(2);
+
+fn dialog(sc: &str) -> Option<u8> {
+    let v: Vec<&str> = sc
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let b = &v[v.len().saturating_sub(16)..];
+    let menu = b.iter().any(|l| {
+        l.strip_prefix('❯').map(str::trim_start).is_some_and(|r| {
+            r.chars().next().is_some_and(|c| c.is_ascii_digit()) && r.contains(". ")
+        })
+    });
+    if !menu {
+        return None;
+    }
+    let has = |p: &str| b.iter().any(|l| l.contains(p));
+    if has("turn on Code Mode") {
+        Some(0)
+    } else if has("trust this folder") || has("trust the files in this folder") {
+        Some(1)
+    } else if has("Do you want to") {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+fn lines(part: &mut Vec<u8>) -> Vec<String> {
+    let Some(cut) = part.iter().rposition(|&b| b == b'\n') else {
+        return vec![];
+    };
+    let rest = part.split_off(cut + 1);
+    let done = std::mem::replace(part, rest);
+    done.split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+        .map(|l| String::from_utf8_lossy(l).into_owned())
+        .collect()
 }
 
 impl Run {
@@ -229,32 +275,41 @@ impl Run {
             sig,
             tr,
             pos: 0,
-            part: String::new(),
+            part: vec![],
             tools: 0,
             txt: String::new(),
             note: String::new(),
             lp: Instant::now(),
             sd: None,
             fin: false,
+            t0: Instant::now(),
+            seen: Instant::now(),
+            sh: 0,
+            dlg: None,
         })
     }
 
-    fn read(&mut self, out: &mut Vec<Ev>) {
-        let Ok(b) = std::fs::read(&self.tr) else {
-            return;
+    fn read(&mut self, out: &mut Vec<Ev>) -> bool {
+        use std::io::{Read, Seek, SeekFrom};
+        let Ok(mut f) = std::fs::File::open(&self.tr) else {
+            return false;
         };
-        if b.len() <= self.pos {
-            return;
+        let n = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if n < self.pos {
+            self.pos = 0;
+            self.part.clear();
         }
-        self.part.push_str(&String::from_utf8_lossy(&b[self.pos..]));
-        self.pos = b.len();
-        let Some(cut) = self.part.rfind('\n') else {
-            return;
+        if n == self.pos || f.seek(SeekFrom::Start(self.pos)).is_err() {
+            return false;
+        }
+        let mut b = vec![];
+        let Ok(k) = f.take(n - self.pos).read_to_end(&mut b) else {
+            return false;
         };
-        let done: String = self.part[..=cut].to_string();
-        self.part = self.part[cut + 1..].to_string();
-        for l in done.lines() {
-            let Ok(v) = serde_json::from_str::<Value>(l) else {
+        self.pos += k as u64;
+        self.part.extend_from_slice(&b);
+        for l in lines(&mut self.part) {
+            let Ok(v) = serde_json::from_str::<Value>(&l) else {
                 continue;
             };
             if v["type"] != "assistant" {
@@ -281,6 +336,7 @@ impl Run {
                 self.txt = t.trim().to_string();
             }
         }
+        k > 0
     }
 
     #[cfg(unix)]
@@ -321,43 +377,77 @@ impl Run {
             return out;
         }
         self.lp = Instant::now();
-        self.read(&mut out);
+        let stop = self.sig.exists();
+        if self.read(&mut out) {
+            self.seen = Instant::now();
+        }
+        if stop {
+            let sd = *self.sd.get_or_insert_with(Instant::now);
+            let w = sd.elapsed().as_millis();
+            if (!self.txt.is_empty() && w >= 250) || w > 1500 {
+                self.fin = true;
+                out.push(Ev::Done(self.answer()));
+            }
+            return out;
+        }
         #[cfg(unix)]
         {
             let sc = self.screen();
             if self.note.is_empty() && sc.contains("Code Mode") && sc.contains("isn't available") {
                 self.note = "Code Mode was not available, the agent ran with ordinary tools".into();
             }
-            let f = |m: &str| Some(Ev::Fail(m.to_string()));
-            let bad = if sc.contains("Yes, turn on Code Mode") {
-                f(
-                    "Code Mode is not confirmed yet. Run `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1 claude` once in a terminal and choose \"Yes, turn on Code Mode\".",
-                )
-            } else if sc.contains("trust this folder") {
-                f(
-                    "This folder is not trusted for interactive Claude Code yet. Run `claude` here once and trust the folder.",
-                )
-            } else if sc.contains("Do you want to") {
-                f(&format!(
+            let h = {
+                use std::hash::{Hash, Hasher};
+                let mut x = std::collections::hash_map::DefaultHasher::new();
+                sc.hash(&mut x);
+                x.finish()
+            };
+            if h != self.sh {
+                self.sh = h;
+                self.seen = Instant::now();
+            }
+            let d = dialog(&sc);
+            let held = match (d, self.dlg) {
+                (Some(k), Some((j, t))) if k == j => t.elapsed() >= HOLD,
+                (Some(k), _) => {
+                    self.dlg = Some((k, Instant::now()));
+                    false
+                }
+                (None, _) => {
+                    self.dlg = None;
+                    false
+                }
+            };
+            let f = |m: String| Some(Ev::Fail(m));
+            let bad = match d {
+                Some(0) if held => f(
+                    "Code Mode is not confirmed yet. Run `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1 claude` once in a terminal and choose \"Yes, turn on Code Mode\".".into(),
+                ),
+                Some(1) if held => f(
+                    "This folder is not trusted for interactive Claude Code yet. Run `claude` here once and trust the folder.".into(),
+                ),
+                Some(_) if held => f(format!(
                     "The code agent stopped at a permission prompt. Use auto or bypass permission mode for code agents.\n\n{}",
                     self.tail()
-                ))
-            } else if matches!(self.ch.try_wait(), Ok(Some(_))) && !self.sig.exists() {
-                f(&format!("The code agent exited early.\n\n{}", self.tail()))
-            } else {
-                None
+                )),
+                _ if crate::live::exited(&mut self.ch) && !self.sig.exists() => {
+                    f(format!("The code agent exited early.\n\n{}", self.tail()))
+                }
+                _ if self.seen.elapsed() >= IDLE => f(format!(
+                    "The code agent made no progress for {} minutes and was stopped. It may be waiting at a prompt.\n\n{}",
+                    IDLE.as_secs() / 60,
+                    self.tail()
+                )),
+                _ if self.t0.elapsed() >= LIM => f(format!(
+                    "The code agent ran longer than {} minutes and was stopped.\n\n{}",
+                    LIM.as_secs() / 60,
+                    self.tail()
+                )),
+                _ => None,
             };
             if let Some(e) = bad {
                 self.fin = true;
                 out.push(e);
-                return out;
-            }
-        }
-        if self.sig.exists() {
-            let sd = *self.sd.get_or_insert_with(Instant::now);
-            if !self.txt.is_empty() || sd.elapsed().as_millis() > 1500 {
-                self.fin = true;
-                out.push(Ev::Done(self.answer()));
             }
         }
         out
@@ -369,5 +459,37 @@ impl Drop for Run {
         #[cfg(unix)]
         crate::live::reap_pub(&mut self.ch);
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dialogs_need_the_menu() {
+        let task =
+            "> fix it. Do you want to check that trust this folder works?\n\n  Working… (3s)";
+        assert_eq!(dialog(task), None);
+        let p =
+            "Bash command\n  rm -rf x\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel";
+        assert_eq!(dialog(p), Some(2));
+        let t = "Quick safety check\n❯ 1. Yes, I trust this folder\n  2. No, exit";
+        assert_eq!(dialog(t), Some(1));
+        let c = "Code Mode\n❯ 1. Yes, turn on Code Mode\n  2. No";
+        assert_eq!(dialog(c), Some(0));
+        let old = format!("Do you want to proceed?\n{}❯ 1. Yes", "line\n".repeat(30));
+        assert_eq!(dialog(&old), None);
+    }
+
+    #[test]
+    fn lines_keep_partial_utf8() {
+        let s = "{\"a\":\"ü\"}\n{\"b\":\"€".as_bytes();
+        let mut p = s[..s.len() - 1].to_vec();
+        assert_eq!(lines(&mut p), vec!["{\"a\":\"ü\"}".to_string()]);
+        p.extend_from_slice(&s[s.len() - 1..]);
+        p.extend_from_slice(b"\"}\n");
+        assert_eq!(lines(&mut p), vec!["{\"b\":\"€\"}".to_string()]);
+        assert!(p.is_empty());
     }
 }
