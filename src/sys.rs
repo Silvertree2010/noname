@@ -368,6 +368,9 @@ pub fn open(path: &str, line: &str) {
         let mut c = Command::new(v.next().unwrap_or_default());
         c.args(v);
         c
+    } else if runs(std::path::Path::new(path)) {
+        reveal(path);
+        return;
     } else if cfg!(target_os = "macos") {
         let mut c = Command::new("open");
         c.arg(path);
@@ -488,16 +491,108 @@ pub fn exists(p: &str) -> bool {
         if m.len() > 4096 {
             m.clear();
         }
-        let e = resolve(p).exists();
+        let e = !remote(p) && stat(resolve(p)).unwrap_or(false);
         m.insert(p.to_string(), (e, now));
         e
+    })
+}
+
+const AUTO: [&str; 6] = ["/net", "/network", "/afs", "/misc", "/smb", "/nfs"];
+
+fn norm(p: &std::path::Path) -> String {
+    let mut o = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                o.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => o.push(c),
+        }
+    }
+    o.to_string_lossy().replace('\\', "/").to_lowercase()
+}
+
+fn share(s: &str) -> Option<String> {
+    let r = s.strip_prefix("//")?;
+    Some(r.split('/').take(2).collect::<Vec<_>>().join("/"))
+}
+
+fn remote(p: &str) -> bool {
+    let t = p.replace('\\', "/");
+    if t.starts_with("//") {
+        return true;
+    }
+    let s = norm(&resolve(p));
+    if AUTO
+        .iter()
+        .any(|r| s == *r || s.strip_prefix(r).is_some_and(|x| x.starts_with('/')))
+    {
+        return true;
+    }
+    let Some(h) = share(&s) else { return false };
+    let own = |b: PathBuf| share(&norm(&b)).as_ref() == Some(&h);
+    !(own(std::env::current_dir().unwrap_or_default()) || own(PathBuf::from(home())))
+}
+
+type Rq = (PathBuf, std::sync::mpsc::Sender<bool>);
+type Sw = (
+    Option<std::sync::mpsc::Sender<Rq>>,
+    Option<std::sync::mpsc::Receiver<bool>>,
+);
+
+thread_local! {
+    static ST: std::cell::RefCell<Sw> = Default::default();
+}
+
+fn stat(p: PathBuf) -> Option<bool> {
+    use std::sync::mpsc;
+    ST.with(|s| {
+        let mut s = s.borrow_mut();
+        if let Some(r) = &s.1 {
+            if r.try_recv() == Err(mpsc::TryRecvError::Empty) {
+                return None;
+            }
+            s.1 = None;
+        }
+        if s.0.is_none() {
+            let (tx, rx) = mpsc::channel::<Rq>();
+            std::thread::Builder::new()
+                .name("stat".into())
+                .spawn(move || {
+                    for (p, r) in rx {
+                        let _ = r.send(p.exists());
+                    }
+                })
+                .ok()?;
+            s.0 = Some(tx);
+        }
+        let (tx, rx) = mpsc::channel();
+        if s.0.as_ref()?.send((p, tx)).is_err() {
+            s.0 = None;
+            return None;
+        }
+        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(e) => Some(e),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                s.1 = Some(rx);
+                None
+            }
+            Err(_) => {
+                s.0 = None;
+                None
+            }
+        }
     })
 }
 
 /// Opens a folder in a new file manager window (on GNOME a new Files window, even
 /// when one is already open).
 pub fn open_dir(path: &str) {
-    let mut c = if cfg!(target_os = "macos") {
+    let mut c = if cfg!(target_os = "macos") && runs(std::path::Path::new(path)) {
+        reveal(path);
+        return;
+    } else if cfg!(target_os = "macos") {
         let mut c = Command::new("open");
         c.arg(path);
         c
@@ -523,6 +618,183 @@ pub fn open_dir(path: &str) {
         c.process_group(0);
     }
     detach(&mut c);
+}
+
+const RUN: &[&str] = &[
+    "exe",
+    "com",
+    "bat",
+    "cmd",
+    "btm",
+    "ps1",
+    "psm1",
+    "psd1",
+    "ps1xml",
+    "vbs",
+    "vbe",
+    "js",
+    "jse",
+    "wsf",
+    "wsh",
+    "wsc",
+    "msi",
+    "msp",
+    "mst",
+    "lnk",
+    "url",
+    "scr",
+    "pif",
+    "hta",
+    "cpl",
+    "msc",
+    "jar",
+    "reg",
+    "inf",
+    "scf",
+    "appref-ms",
+    "application",
+    "gadget",
+    "settingcontent-ms",
+    "library-ms",
+    "search-ms",
+    "searchconnector-ms",
+    "appx",
+    "appxbundle",
+    "msix",
+    "msixbundle",
+    "appinstaller",
+    "diagcab",
+    "chm",
+    "xll",
+    "website",
+    "iso",
+    "img",
+    "vhd",
+    "vhdx",
+    "app",
+    "command",
+    "tool",
+    "terminal",
+    "workflow",
+    "action",
+    "pkg",
+    "mpkg",
+    "fileloc",
+    "prefpane",
+    "saver",
+    "kext",
+    "mobileconfig",
+    "shortcut",
+    "desktop",
+    "appimage",
+    "deb",
+    "rpm",
+    "flatpakref",
+    "snap",
+];
+
+const SCR: &[&str] = &[
+    "py", "pyw", "pyz", "pyc", "pl", "rb", "sh", "bash", "zsh", "tcl",
+];
+
+fn ext(p: &std::path::Path) -> Option<String> {
+    let n = p.file_name()?.to_string_lossy().to_lowercase();
+    let n = n.trim_end_matches(['.', ' ']);
+    n.rsplit_once('.').map(|x| x.1.to_string())
+}
+
+fn launcher(p: &std::path::Path) -> bool {
+    ext(p).is_some_and(|e| {
+        RUN.contains(&e.as_str())
+            || (cfg!(any(windows, target_os = "macos")) && SCR.contains(&e.as_str()))
+            || (cfg!(windows)
+                && std::env::var("PATHEXT").is_ok_and(|v| {
+                    v.split(';')
+                        .any(|x| x.trim_start_matches('.').eq_ignore_ascii_case(&e))
+                }))
+    })
+}
+
+fn runs(p: &std::path::Path) -> bool {
+    launcher(p) || std::fs::canonicalize(p).is_ok_and(|c| launcher(&c)) || exe_bit(p)
+}
+
+#[cfg(unix)]
+fn exe_bit(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn exe_bit(_: &std::path::Path) -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+fn uri(b: &[u8]) -> String {
+    let mut o = String::from("file://");
+    for &c in b {
+        if c.is_ascii_alphanumeric() || matches!(c, b'/' | b'-' | b'.' | b'_' | b'~') {
+            o.push(c as char);
+        } else {
+            o.push_str(&format!("%{c:02X}"));
+        }
+    }
+    o
+}
+
+fn quiet(c: &mut Command) -> &mut Command {
+    c.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+}
+
+fn reveal(path: &str) {
+    if cfg!(target_os = "macos") {
+        let mut c = Command::new("open");
+        c.args(["-R", path]);
+        quiet(&mut c);
+        detach(&mut c);
+        return;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut c = Command::new("explorer");
+        c.raw_arg(format!("/select,\"{}\"", path.replace('/', "\\")));
+        quiet(&mut c);
+        detach(&mut c);
+    }
+    #[cfg(not(windows))]
+    {
+        let p = std::path::Path::new(path);
+        let up = p
+            .parent()
+            .map(|d| d.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let Some(d) = which("dbus-send") else {
+            open_dir(&up);
+            return;
+        };
+        let mut c = Command::new(d);
+        c.args([
+            "--session",
+            "--print-reply",
+            "--reply-timeout=5000",
+            "--dest=org.freedesktop.FileManager1",
+            "--type=method_call",
+            "/org/freedesktop/FileManager1",
+            "org.freedesktop.FileManager1.ShowItems",
+            &format!("array:string:{}", uri(p.as_os_str().as_encoded_bytes())),
+            "string:",
+        ]);
+        quiet(&mut c);
+        std::thread::spawn(move || {
+            if !c.status().is_ok_and(|s| s.success()) {
+                open_dir(&up);
+            }
+        });
+    }
 }
 
 /// Starts an opener and waits for it on a thread, so a finished opener (xdg-open exits once
@@ -562,13 +834,14 @@ pub fn xclip_first() -> bool {
     std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty()) && which("xclip").is_some()
 }
 
-/// Puts text on the system clipboard. Returns false when no clipboard tool was found,
+/// Puts text on the system clipboard. Returns false when no clipboard tool was found or `clip` failed (Windows),
 /// so the caller can say that only the terminal's own clipboard (OSC 52) was tried.
 pub fn setclip(t: &str) -> bool {
+    if cfg!(windows) {
+        return winclip(t);
+    }
     let c: Option<(&str, &[&str])> = if cfg!(target_os = "macos") {
         Some(("pbcopy", &[]))
-    } else if cfg!(windows) {
-        None
     } else if std::env::var("WAYLAND_DISPLAY").is_ok()
         && which("wl-copy").is_some()
         && !xclip_first()
@@ -580,7 +853,7 @@ pub fn setclip(t: &str) -> bool {
         None
     };
     let Some((p, a)) = c else {
-        return cfg!(windows);
+        return false;
     };
     let Ok(mut ch) = Command::new(p)
         .args(a)
@@ -597,6 +870,30 @@ pub fn setclip(t: &str) -> bool {
     }
     std::thread::spawn(move || ch.wait());
     true
+}
+
+fn u16le(t: &str) -> Vec<u8> {
+    std::iter::once(0xfeff)
+        .chain(t.encode_utf16())
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+fn winclip(t: &str) -> bool {
+    use std::io::Write;
+    let Ok(mut ch) = Command::new("clip")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let w = ch
+        .stdin
+        .take()
+        .is_some_and(|mut i| i.write_all(&u16le(t)).is_ok());
+    ch.wait().is_ok_and(|s| s.success()) && w
 }
 
 #[derive(Clone)]
@@ -890,5 +1187,108 @@ mod tests {
         assert_eq!(open_cmd("nvim +{line}", p, ""), ["nvim", "+1", p]);
         // a path that holds `{line}` itself is not filled in
         assert_eq!(open_cmd("ed {}", "/t/{line}", "3"), ["ed", "/t/{line}"]);
+    }
+
+    #[test]
+    fn remote_paths_are_never_stat() {
+        for p in [
+            "//host/share/x",
+            "\\\\host\\share",
+            "\\\\?\\UNC\\host\\s",
+            "//?/C:/x",
+        ] {
+            assert!(remote(p), "{p}");
+            assert!(!exists(p), "{p}");
+        }
+        #[cfg(unix)]
+        for p in [
+            "/net/host/x",
+            "/Network/Servers/h",
+            "/afs/cell/x",
+            "/net",
+            "/tmp/../net/host",
+        ] {
+            assert!(remote(p), "{p}");
+            assert!(!exists(p), "{p}");
+        }
+        for p in [
+            "/tmp/x",
+            "src/main.rs",
+            "/network-tools/a",
+            "~/x",
+            "/netx/a",
+        ] {
+            assert!(!remote(p), "{p}");
+        }
+        assert!(exists("src/sys.rs"));
+        assert_eq!(share("//host/share/a/b").as_deref(), Some("host/share"));
+        assert_eq!(share("/a"), None);
+    }
+
+    #[test]
+    fn launchers_are_detected() {
+        let l = |s: &str| launcher(std::path::Path::new(s));
+        for p in [
+            "setup.bat",
+            "a/b/Run.EXE",
+            "x.lnk",
+            "y.url",
+            "z.ps1",
+            "c.cmd",
+            "v.vbs",
+            "w.js",
+            "Foo.app",
+            "go.command",
+            "t.tool",
+            "s.terminal",
+            "n.desktop",
+            "setup.exe.",
+            "k.jar",
+        ] {
+            assert!(l(p), "{p}");
+        }
+        for p in [
+            "src/main.rs",
+            "README.md",
+            "a.txt",
+            "Makefile",
+            "photo.png",
+            "x.exe.txt",
+        ] {
+            assert!(!l(p), "{p}");
+        }
+        assert_eq!(l("tool.py"), cfg!(any(windows, target_os = "macos")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_bit_counts_as_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("noname-runs-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("plain");
+        std::fs::write(&f, "x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!runs(&f));
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(runs(&f));
+        let k = d.join("notes.md");
+        std::os::unix::fs::symlink(d.join("x.desktop"), &k).unwrap();
+        std::fs::write(d.join("x.desktop"), "x").unwrap();
+        assert!(runs(&k));
+        assert!(!runs(&d));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn reveal_uri_is_escaped() {
+        assert_eq!(uri(b"/a b/c,d.sh"), "file:///a%20b/c%2Cd.sh");
+        assert_eq!(uri("/ä".as_bytes()), "file:///%C3%A4");
+    }
+
+    #[test]
+    fn clip_gets_utf16_with_bom() {
+        assert_eq!(u16le("aé"), [0xff, 0xfe, b'a', 0, 0xe9, 0]);
     }
 }
