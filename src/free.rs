@@ -44,7 +44,7 @@ fn setflag(c: &AtomicU8, k: &str, on: bool) {
     if let Some(d) = std::path::Path::new(&f).parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    let _ = std::fs::write(&f, if on { "on" } else { "off" });
+    let _ = sys::save(&f, if on { "on" } else { "off" });
 }
 
 /// Seconds between two reads of Claude's own total (it only changes when a turn ends).

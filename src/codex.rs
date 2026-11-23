@@ -105,6 +105,60 @@ fn cfg_model() -> String {
         .unwrap_or_else(|| "codex".into())
 }
 
+pub(crate) fn spawn_err(nm: &str, e: &io::Error) -> String {
+    if e.kind() == io::ErrorKind::NotFound {
+        format!("{nm} not found")
+    } else {
+        format!("{nm} failed to start: {e}")
+    }
+}
+
+pub(crate) fn build(
+    c: &Cx,
+    mode: usize,
+    imgs: &[(&'static str, Vec<u8>)],
+    t: u64,
+    x: &str,
+) -> (Command, Option<String>) {
+    let mut cmd = Command::new(crate::sys::bin("codex"));
+    cmd.arg("exec");
+    if c.tid.is_some() || c.last {
+        cmd.arg("resume");
+    }
+    cmd.args(["--json", "--skip-git-repo-check"]);
+    match mode {
+        1 => {
+            cmd.args(["-s", "read-only"]);
+        }
+        3 => {
+            cmd.arg("--dangerously-bypass-approvals-and-sandbox");
+        }
+        _ => {
+            cmd.args(["-s", "workspace-write"]);
+        }
+    }
+    cmd.args(&c.args);
+    for (k, (m, b)) in imgs.iter().enumerate() {
+        let n = format!(
+            "noname-{}-{t}-{k}.{}",
+            std::process::id(),
+            crate::img::ext(m)
+        );
+        if let Some(f) = crate::sys::tmp_write(&n, b) {
+            cmd.arg("-i").arg(f);
+        }
+    }
+    if c.tid.is_none() && c.last {
+        cmd.arg("--last");
+    }
+    cmd.arg("--");
+    if let Some(id) = &c.tid {
+        cmd.arg(id);
+    }
+    cmd.arg("-");
+    (cmd, Some(x.to_string()))
+}
+
 impl App {
     /// Builds an `App` that uses Codex as the engine (one `codex exec` per message). `args` holds the command-line flags (`-c`, `-r`, `-m`) and the arguments passed through to `codex`.
     ///
@@ -267,63 +321,37 @@ impl App {
         c.tok = 0;
         c.err.clear();
         c.fin = false;
-        let mut cmd = if c.eng == Eng::Agy {
+        let (mut cmd, inp) = if c.eng == Eng::Agy {
             crate::agy::build(c, mode, &imgs, t, &x)
         } else if c.eng == Eng::Opencode {
             crate::opencode::build(c, mode, &imgs, t, &x)
         } else {
-            let mut cmd = Command::new(crate::sys::bin("codex"));
-            cmd.arg("exec");
-            let resume = c.tid.is_some() || c.last;
-            if resume {
-                cmd.arg("resume");
-            }
-            cmd.args(["--json", "--skip-git-repo-check"]);
-            match mode {
-                1 => {
-                    cmd.args(["-s", "read-only"]);
-                }
-                3 => {
-                    cmd.arg("--dangerously-bypass-approvals-and-sandbox");
-                }
-                _ => {
-                    cmd.args(["-s", "workspace-write"]);
-                }
-            }
-            cmd.args(&c.args);
-            for (k, (m, b)) in imgs.iter().enumerate() {
-                let n = format!(
-                    "noname-{}-{t}-{k}.{}",
-                    std::process::id(),
-                    crate::img::ext(m)
-                );
-                if let Some(f) = crate::sys::tmp_write(&n, b) {
-                    cmd.arg("-i").arg(f);
-                }
-            }
-            match (&c.tid, c.last) {
-                (Some(id), _) => {
-                    cmd.arg(id);
-                }
-                (None, true) => {
-                    cmd.arg("--last");
-                }
-                _ => {}
-            }
-            cmd.arg(&x);
-            cmd
+            build(c, mode, &imgs, t, &x)
         };
         let agy = c.eng == Eng::Agy;
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(if agy { Stdio::piped() } else { Stdio::null() });
+        cmd.stdin(if inp.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(if agy { Stdio::piped() } else { Stdio::null() });
         live::guard_pub(&mut cmd);
-        let Ok(mut ch) = cmd.spawn() else {
-            self.busy = false;
-            self.bs.push(B::Sys(format!("{nm} not found")));
-            return;
+        let mut ch = match cmd.spawn() {
+            Ok(ch) => ch,
+            Err(e) => {
+                self.busy = false;
+                self.bs.push(B::Sys(spawn_err(nm, &e)));
+                return;
+            }
         };
-        live::track_pid(ch.id() as i32);
+        live::track_child(&ch);
+        if let (Some(mut si), Some(p)) = (ch.stdin.take(), inp) {
+            thread::spawn(move || {
+                use std::io::Write;
+                let _ = si.write_all(p.as_bytes());
+            });
+        }
         let out = ch.stdout.take().expect("stdout is piped above");
         let (tx, rx) = channel();
         // agy reports sign-in problems and denied permissions on stderr only
@@ -375,7 +403,7 @@ impl App {
         c.im.clear();
     }
 
-    pub(crate) fn cstop(&mut self) {
+    fn ckill(&mut self) {
         if let Some(c) = &mut self.cx {
             if let Some(mut ch) = c.ch.take() {
                 live::untrack_pid(ch.id() as i32);
@@ -383,6 +411,10 @@ impl App {
             }
             c.rx = None;
         }
+    }
+
+    pub(crate) fn cstop(&mut self) {
+        self.ckill();
         for b in self.bs.iter_mut() {
             if let B::Tl(t) = b {
                 if t.st == St::Run {
@@ -401,10 +433,14 @@ impl App {
         let (c, arg) = r.split_once(' ').unwrap_or((r, ""));
         match c {
             "clear" | "new" => {
+                self.ckill();
                 if let Some(x) = &mut self.cx {
                     x.tid = None;
                     x.last = false;
+                    x.im.clear();
                 }
+                self.busy = false;
+                self.sb = None;
                 self.bs.clear();
                 self.todo.clear();
                 self.tc = self.t;
@@ -516,8 +552,8 @@ impl App {
                 } else {
                     B::T(txt)
                 };
-                match ex {
-                    Some(i) => self.bs[i] = b,
+                match ex.and_then(|i| self.bs.get_mut(i)) {
+                    Some(s) => *s = b,
                     None => {
                         self.bs.push(b);
                         let i = self.bs.len() - 1;
@@ -619,5 +655,76 @@ impl App {
             "error" => self.bs.push(B::Sys(one(&sv(it, "message"), 200))),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cx() -> Cx {
+        Cx {
+            tid: None,
+            ch: None,
+            rx: None,
+            args: vec![],
+            im: HashMap::new(),
+            last: false,
+            t0: 0,
+            eng: Eng::Codex,
+            tok: 0,
+            err: String::new(),
+            fin: false,
+        }
+    }
+
+    fn args(c: &Cx, x: &str) -> (Vec<String>, Option<String>) {
+        let (cmd, i) = build(c, 0, &[], 0, x);
+        let v = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+        (v, i)
+    }
+
+    #[test]
+    fn the_prompt_goes_through_stdin() {
+        let mut c = cx();
+        let (v, i) = args(&c, "-x\nline two");
+        assert_eq!(v[..2], ["exec", "--json"]);
+        assert_eq!(v[v.len() - 2..], ["--", "-"]);
+        assert_eq!(i.as_deref(), Some("-x\nline two"));
+        c.last = true;
+        let (v, _) = args(&c, "x");
+        assert_eq!(v[1], "resume");
+        assert_eq!(v[v.len() - 3..], ["--last", "--", "-"]);
+        c.tid = Some("abc".into());
+        let (v, _) = args(&c, "x");
+        assert!(!v.contains(&"--last".to_string()));
+        assert_eq!(v[v.len() - 3..], ["--", "abc", "-"]);
+    }
+
+    #[test]
+    fn spawn_errors_say_what_happened() {
+        let e = io::Error::from(io::ErrorKind::NotFound);
+        assert_eq!(spawn_err("codex", &e), "codex not found");
+        let e = io::Error::other("batch file arguments are invalid");
+        assert!(spawn_err("codex", &e).contains("batch file arguments are invalid"));
+    }
+
+    #[test]
+    fn clear_forgets_item_indices() {
+        let msg = |id: &str, t: &str| json!({"id": id, "type": "agent_message", "text": t});
+        let mut a = App::codex(vec![]).unwrap();
+        a.cev(json!({"type": "item.started", "item": msg("i1", "a")}));
+        a.cev(json!({"type": "item.started", "item": msg("i2", "b")}));
+        a.ccmd("clear");
+        assert!(a.bs.is_empty() && a.cx.as_ref().unwrap().im.is_empty());
+        a.cev(json!({"type": "item.updated", "item": msg("i2", "c")}));
+        assert_eq!(a.bs.len(), 1);
+        a.cx.as_mut().unwrap().im.insert("i9".into(), 99);
+        a.cev(json!({"type": "item.updated", "item": msg("i9", "d")}));
+        a.cx.as_mut().unwrap().im.insert("o9".into(), 99);
+        a.ocev(json!({"type": "text", "part": {"id": "o9", "text": "e"}}));
     }
 }

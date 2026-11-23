@@ -100,7 +100,7 @@ pub(crate) fn build(
     imgs: &[(&'static str, Vec<u8>)],
     t: u64,
     x: &str,
-) -> Command {
+) -> (Command, Option<String>) {
     let mut cmd = Command::new(crate::sys::bin("opencode"));
     cmd.args(["run", "--format", "json", "--thinking"]);
     match mode {
@@ -127,10 +127,6 @@ pub(crate) fn build(
     if let Some(n) = name {
         cmd.args(["--command", n]);
     }
-    // the message goes before -f, because -f takes a list and would swallow it
-    if !x.is_empty() {
-        cmd.arg(x);
-    }
     for (k, (m, b)) in imgs.iter().enumerate() {
         let n = format!(
             "noname-{}-{t}-{k}.{}",
@@ -141,7 +137,7 @@ pub(crate) fn build(
             cmd.arg("-f").arg(f);
         }
     }
-    cmd
+    (cmd, Some(x.to_string()))
 }
 
 fn base(p: &str) -> String {
@@ -171,8 +167,13 @@ impl App {
                 } else {
                     B::T(txt.trim().to_string())
                 };
-                match self.cx.as_ref().and_then(|c| c.im.get(&id).copied()) {
-                    Some(i) => self.bs[i] = b,
+                match self
+                    .cx
+                    .as_ref()
+                    .and_then(|c| c.im.get(&id).copied())
+                    .and_then(|i| self.bs.get_mut(i))
+                {
+                    Some(s) => *s = b,
                     None => {
                         self.bs.push(b);
                         let i = self.bs.len() - 1;
@@ -384,18 +385,25 @@ mod tests {
             fin: false,
         };
         let a = |x: &str| {
-            build(&c, 0, &[], 0, x)
+            let (c, i) = build(&c, 0, &[], 0, x);
+            let v = c
                 .get_args()
                 .map(|s| s.to_string_lossy().to_string())
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (v, i.unwrap_or_default())
         };
-        let v = a("/researcher rust");
+        let (v, i) = a("/researcher rust");
         assert!(v.windows(2).any(|w| w == ["--command", "researcher"]));
-        assert_eq!(v.last().map(String::as_str), Some("rust"));
-        let v = a("/researcher");
-        assert!(v.contains(&"--command".to_string()) && !v.contains(&"rust".to_string()));
-        let v = a("plain words");
+        assert!(!v.contains(&"rust".to_string()));
+        assert_eq!(i, "rust");
+        let (v, i) = a("/researcher");
+        assert!(v.contains(&"--command".to_string()) && i.is_empty());
+        let (v, i) = a("plain words");
         assert!(!v.contains(&"--command".to_string()));
-        assert_eq!(v.last().map(String::as_str), Some("plain words"));
+        assert_eq!(v.last().map(String::as_str), Some("--thinking"));
+        assert_eq!(i, "plain words");
+        let (v, i) = a("-x\nline two");
+        assert!(v.iter().all(|s| !s.contains("line two")));
+        assert_eq!(i, "-x\nline two");
     }
 }

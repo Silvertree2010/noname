@@ -90,8 +90,18 @@ jobs:
           cat *.sha256 > SHA256SUMS
           sha256sum *.deb *.rpm >> SHA256SUMS
           cd ..
-          packaging/render.sh "${TAG#v}" dist/SHA256SUMS dist/packaging
-          tar -C dist -czf dist/packaging.tar.gz packaging
+          packaging/render.sh "${TAG#v}" dist/SHA256SUMS pkg/packaging
+          tar -C pkg -czf dist/packaging.tar.gz packaging
+      - name: upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --draft --title "noname $TAG" --generate-notes --verify-tag
+          gh release upload "$TAG" dist/* install.sh install.ps1 --clobber
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$TAG" --draft=false --latest
       - name: update tap and bucket
         env:
           TAP_KEY: ${{ secrets.TAP_KEY }}
@@ -106,18 +116,10 @@ jobs:
             IFS=: read -r repo key file dir <<< "$r"
             export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/$key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
             git clone -q "git@github.com:Silvertree2010/$repo.git" "/tmp/$repo"
-            cp "dist/packaging/$file" "/tmp/$repo/$dir/"
+            cp "pkg/packaging/$file" "/tmp/$repo/$dir/"
             if ! git -C "/tmp/$repo" diff --quiet; then
               git -C "/tmp/$repo" commit -qam "noname $TAG"
               git -C "/tmp/$repo" push -q
             fi
           done
           rm -f ~/.ssh/tap ~/.ssh/bucket
-      - name: clean up
-        run: rm -rf dist/packaging
-      - name: publish
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "noname $TAG" --generate-notes --verify-tag
-          gh release upload "$TAG" dist/* install.sh install.ps1 --clobber

@@ -34,7 +34,7 @@ pub(crate) fn build(
     imgs: &[(&'static str, Vec<u8>)],
     t: u64,
     x: &str,
-) -> Command {
+) -> (Command, Option<String>) {
     let mut cmd = Command::new(crate::sys::bin("agy"));
     cmd.args(["--output-format", "stream-json"]);
     match mode {
@@ -73,8 +73,13 @@ pub(crate) fn build(
             p.push_str(&format!("\n\n(attached image: {})", f.display()));
         }
     }
-    cmd.arg("-p").arg(p);
-    cmd
+    if imgs.is_empty() && x.starts_with('/') && x.len() < 2000 && !x.contains(['\r', '\n']) {
+        cmd.arg("-p").arg(p);
+        return (cmd, None);
+    }
+    cmd.args(["--input-format", "stream-json"]);
+    let l = serde_json::json!({"event": "user", "message": {"content": p}});
+    (cmd, Some(format!("{l}\n")))
 }
 
 fn base(p: &str) -> String {
@@ -385,6 +390,7 @@ mod tests {
 
     fn args(c: &Cx, mode: usize, x: &str) -> Vec<String> {
         build(c, mode, &[], 0, x)
+            .0
             .get_args()
             .map(|s| s.to_string_lossy().to_string())
             .collect()
@@ -423,7 +429,24 @@ mod tests {
     fn builds_a_print_run() {
         let a = app();
         let v = args(cx(&a), 0, "hello there");
-        assert_eq!(v, ["--output-format", "stream-json", "-p", "hello there"]);
+        assert_eq!(
+            v,
+            [
+                "--output-format",
+                "stream-json",
+                "--input-format",
+                "stream-json"
+            ]
+        );
+        let (_, i) = build(cx(&a), 0, &[], 0, "-a\nb");
+        let i = i.unwrap();
+        assert!(i.ends_with('\n') && i.matches('\n').count() == 1);
+        let v: Value = serde_json::from_str(&i).unwrap();
+        assert_eq!(v, json!({"event": "user", "message": {"content": "-a\nb"}}));
+        let (c, i) = build(cx(&a), 0, &[], 0, "/researcher rust");
+        assert!(i.is_none());
+        assert!(c.get_args().any(|s| s == "-p"));
+        assert!(build(cx(&a), 0, &[], 0, "/researcher\nrust").1.is_some());
     }
 
     #[test]
