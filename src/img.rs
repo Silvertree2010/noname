@@ -84,6 +84,17 @@ pub fn b64(b: &[u8]) -> String {
 }
 
 fn unesc(s: &str) -> String {
+    unesc2(s, cfg!(windows))
+}
+
+fn unesc2(s: &str, win: bool) -> String {
+    if win {
+        let t = s.replace('"', "");
+        return match t.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')) {
+            Some(x) => x.to_string(),
+            None => t,
+        };
+    }
     let mut o = String::new();
     let mut it = s.chars();
     while let Some(c) = it.next() {
@@ -120,6 +131,10 @@ fn undec(s: &str) -> String {
 }
 
 fn split(s: &str) -> Vec<String> {
+    split2(s, cfg!(windows))
+}
+
+fn split2(s: &str, win: bool) -> Vec<String> {
     let mut v = vec![];
     let mut cur = String::new();
     let mut q: Option<char> = None;
@@ -129,7 +144,7 @@ fn split(s: &str) -> Vec<String> {
             (Some(x), c) if c == x => q = None,
             (Some(_), c) => cur.push(c),
             (None, '\'' | '"') => q = Some(c),
-            (None, '\\') => {
+            (None, '\\') if !win => {
                 if let Some(n) = it.next() {
                     cur.push('\\');
                     cur.push(n);
@@ -298,7 +313,7 @@ fn clip_win(txt: bool) -> Clip {
     let tmp = std::env::temp_dir().join(format!("noname-clip-{}.png", std::process::id()));
     let p = tmp.to_string_lossy().replace('\'', "''");
     let sc = format!(
-        "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; $i=[System.Windows.Forms.Clipboard]::GetImage(); if($i){{$i.Save('{p}',[System.Drawing.Imaging.ImageFormat]::Png); 'ok'}} else {{ $f=[System.Windows.Forms.Clipboard]::GetFileDropList(); if($f.Count){{$f}} {t} }}",
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Add-Type -AssemblyName System.Windows.Forms,System.Drawing; $i=[System.Windows.Forms.Clipboard]::GetImage(); if($i){{$i.Save('{p}',[System.Drawing.Imaging.ImageFormat]::Png); 'ok'}} else {{ $f=[System.Windows.Forms.Clipboard]::GetFileDropList(); if($f.Count){{$f}} {t} }}",
         t = if txt {
             "elseif([System.Windows.Forms.Clipboard]::ContainsText()){ 'text'; [System.Windows.Forms.Clipboard]::GetText() }"
         } else {
@@ -437,15 +452,15 @@ pub fn shrink(b: Vec<u8>) -> Result<(Vec<u8>, &'static str), usize> {
     if crate::sys::which("ffmpeg").is_none() {
         return Err(n);
     }
-    let d = std::env::temp_dir();
-    let id = std::process::id();
-    let src = d.join(format!("noname-big-{id}.{}", ext(m)));
+    let Some(d) = pdir() else { return Err(n) };
+    let src = d.join(format!("big.{}", ext(m)));
     if std::fs::write(&src, &b).is_err() {
+        let _ = std::fs::remove_dir_all(&d);
         return Err(n);
     }
     let mut best = Err(n);
     for (px, q) in [(2400, "3"), (1800, "5"), (1200, "8")] {
-        let dst = d.join(format!("noname-small-{id}.jpg"));
+        let dst = d.join("small.jpg");
         let vf = format!("scale='min({px},iw)':-2");
         let ok = Command::new("ffmpeg")
             .args(["-y", "-loglevel", "error", "-i"])
@@ -466,6 +481,69 @@ pub fn shrink(b: Vec<u8>) -> Result<(Vec<u8>, &'static str), usize> {
             }
         }
     }
-    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_dir_all(&d);
     best
+}
+
+fn pdir() -> Option<PathBuf> {
+    use std::hash::{BuildHasher, Hasher};
+    for _ in 0..8 {
+        let r = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        let d = std::env::temp_dir().join(format!("noname-{}-{r:016x}", std::process::id()));
+        let b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        let b = {
+            let mut b = b;
+            std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+            b
+        };
+        if b.create(&d).is_ok() {
+            return Some(d);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_paths_keep_backslashes() {
+        assert_eq!(
+            unesc2(r#""C:\Users\x\a b.png""#, true),
+            r"C:\Users\x\a b.png"
+        );
+        assert_eq!(unesc2(r"'C:\it's\a.png'", true), r"C:\it's\a.png");
+        assert_eq!(unesc2(r"/home/x/a\ b.png", false), "/home/x/a b.png");
+        assert_eq!(
+            split2(r#"C:\a\x.png "C:\b c\y.png""#, true),
+            [r"C:\a\x.png", r"C:\b c\y.png"]
+        );
+        assert_eq!(
+            split2(r"/a/x\ y.png /b.png", false)
+                .iter()
+                .map(|x| unesc2(x, false))
+                .collect::<Vec<_>>(),
+            ["/a/x y.png", "/b.png"]
+        );
+    }
+
+    #[test]
+    fn private_dir_is_fresh_and_closed() {
+        let a = pdir();
+        let b = pdir();
+        assert!(a.is_some() && a != b);
+        for d in [a, b].into_iter().flatten() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let m = std::fs::metadata(&d).map(|x| x.permissions().mode() & 0o777);
+                assert_eq!(m.ok(), Some(0o700));
+            }
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
 }

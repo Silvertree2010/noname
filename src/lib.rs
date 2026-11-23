@@ -219,10 +219,7 @@ pub mod pal {
     /// Saves the active theme's name to the theme file.
     pub fn save() {
         let f = file();
-        if let Some(d) = std::path::Path::new(&f).parent() {
-            let _ = std::fs::create_dir_all(d);
-        }
-        let _ = std::fs::write(&f, all()[cur()].name);
+        crate::wcfg(&f, all()[cur()].name);
     }
     fn c(i: usize) -> Color {
         let v = all()[cur()].c[i];
@@ -675,6 +672,8 @@ pub struct App {
     uk: bool,
     unre: bool,
     drf: Option<String>,
+    hed: Vec<(usize, String)>,
+    dlg: Option<(String, u64, bool)>,
     /// Input box geometry of the last frame as (top row, height, text width).
     pub ig: Cell<(u16, u16, usize)>,
     /// Background tasks (shells, monitors, agents, workflows).
@@ -1014,6 +1013,8 @@ impl App {
             uk: false,
             unre: false,
             drf: None,
+            hed: vec![],
+            dlg: None,
             ig: Cell::new((0, 0, 0)),
             tasks: vec![],
             clip: String::new(),
@@ -1087,6 +1088,7 @@ impl App {
     /// Advances one tick: runs background polls, timers and update checks, then plays the next scripted step or pumps the live engine.
     pub fn step(&mut self) {
         self.t += 1;
+        self.dlgsync();
         self.fpoll();
         if let Some((s, true)) = self.tk {
             if self.t >= self.tkp + 30 {
@@ -1189,7 +1191,7 @@ impl App {
             }
             Sp::Fin => {
                 if let Some(i) = self.ti.take() {
-                    if let B::Tl(t) = &mut self.bs[i] {
+                    if let Some(B::Tl(t)) = self.bs.get_mut(i) {
                         t.st = if self.tf { St::Err } else { St::Ok };
                         t.t1 = self.t;
                     }
@@ -1220,13 +1222,9 @@ impl App {
     }
 
     fn stream(&mut self, th: bool, c: String) {
-        match self.sb {
-            Some(i) => {
-                if let B::Th(s) | B::T(s) = &mut self.bs[i] {
-                    s.push_str(&c)
-                }
-            }
-            None => {
+        match self.sb.and_then(|i| self.bs.get_mut(i)) {
+            Some(B::Th(s) | B::T(s)) => s.push_str(&c),
+            _ => {
                 self.bs.push(if th { B::Th(c) } else { B::T(c) });
                 self.sb = Some(self.bs.len() - 1);
             }
@@ -1242,7 +1240,7 @@ impl App {
             return;
         }
         let Some(i) = self.ask.take() else { return };
-        if let B::Ask(a) = &mut self.bs[i] {
+        if let Some(B::Ask(a)) = self.bs.get_mut(i) {
             a.ans = Some(c);
         }
         if c == 'n' {
@@ -1281,14 +1279,14 @@ impl App {
         self.q.clear();
         self.wait = 0;
         if let Some(i) = self.ti.take() {
-            if let B::Tl(t) = &mut self.bs[i] {
+            if let Some(B::Tl(t)) = self.bs.get_mut(i) {
                 t.st = St::Err;
                 t.t1 = self.t;
                 t.sum = "interrupted".into();
             }
         }
         if let Some(i) = self.ask.take() {
-            if let B::Ask(a) = &mut self.bs[i] {
+            if let Some(B::Ask(a)) = self.bs.get_mut(i) {
                 a.ans = Some('n');
             }
         }
@@ -1299,10 +1297,28 @@ impl App {
 
     /// Sends the input box: a background name, a `/` command or a prompt for the current engine.
     pub fn submit(&mut self) {
-        let s = self.inp.trim().to_string();
-        if s.is_empty() {
+        if self.inp.trim().is_empty() {
             return;
         }
+        let d = if self.hi.is_some() {
+            self.drf.take().filter(|d| !d.is_empty())
+        } else {
+            None
+        };
+        self.hed.clear();
+        self.submit0();
+        if let Some(d) = d {
+            if self.inp.is_empty() {
+                self.inp = d;
+                self.cur = self.nch();
+            } else if self.hist.last() != Some(&d) {
+                self.hist.push(d);
+            }
+        }
+    }
+
+    fn submit0(&mut self) {
+        let s = self.inp.trim().to_string();
         self.inp.clear();
         self.cur = 0;
         self.scr = 0;
@@ -1310,6 +1326,7 @@ impl App {
         self.ts = self.t.max(1);
         self.hist.push(s.clone());
         self.hi = None;
+        self.drf = None;
         if let Some(k) = bg::canon(&s) {
             self.setbg(Some(k));
             return;
@@ -1352,27 +1369,61 @@ impl App {
         self.bgw = k;
         if self.lv.is_some() || self.cx.is_some() {
             let f = bgfile();
-            if let Some(d) = std::path::Path::new(&f).parent() {
-                let _ = std::fs::create_dir_all(d);
-            }
-            let _ = std::fs::write(&f, k.unwrap_or("off"));
+            wcfg(&f, k.unwrap_or("off"));
         }
     }
 
+    fn dlgsync(&mut self) {
+        let k = match (&self.qa, self.ask) {
+            (Some(q), _) => Some(format!("q{}#{}", q.id, q.i)),
+            (None, Some(i)) => Some(format!("a{i}")),
+            _ => None,
+        };
+        if self.dlg.as_ref().map(|d| &d.0) != k.as_ref() {
+            self.dlg = k.map(|k| (k, self.t, false));
+        }
+    }
+
+    fn armed(&self) -> bool {
+        self.dlg.as_ref().is_some_and(|d| self.t >= d.1 + QGRACE)
+    }
+
     fn qkey(&mut self, k: KeyEvent) -> bool {
+        let armed = self.armed();
+        let idle = self.inp.is_empty();
+        let nav = self.dlg.as_ref().is_some_and(|d| d.2);
         let Some(q) = &mut self.qa else { return false };
         let cur = &q.qs[q.i];
         let n = cur.opts.len();
         let other = q.sel == n;
         match k.code {
+            KeyCode::Esc if !armed => {
+                if !idle {
+                    self.clearinp();
+                }
+            }
             KeyCode::Esc => {
                 self.qdone(false);
                 return true;
             }
-            KeyCode::Up => q.sel = q.sel.saturating_sub(1),
-            KeyCode::Down => q.sel = (q.sel + 1).min(n),
+            KeyCode::Up | KeyCode::Down | KeyCode::Enter if !armed => {}
+            KeyCode::Up | KeyCode::Down => {
+                q.sel = if k.code == KeyCode::Up {
+                    q.sel.saturating_sub(1)
+                } else {
+                    (q.sel + 1).min(n)
+                };
+                if let Some(d) = &mut self.dlg {
+                    d.2 = true;
+                }
+            }
             KeyCode::Char(c)
-                if !other && c.is_ascii_digit() && c != '0' && (c as usize - '1' as usize) < n =>
+                if armed
+                    && idle
+                    && !other
+                    && c.is_ascii_digit()
+                    && c != '0'
+                    && (c as usize - '1' as usize) < n =>
             {
                 let j = c as usize - '1' as usize;
                 q.sel = j;
@@ -1382,7 +1433,9 @@ impl App {
                     self.qnext(cur_label(&self.qa, j));
                 }
             }
-            KeyCode::Char(' ') if !other && cur.multi => q.pick[q.sel] = !q.pick[q.sel],
+            KeyCode::Char(' ') if armed && idle && !other && cur.multi => {
+                q.pick[q.sel] = !q.pick[q.sel]
+            }
             KeyCode::Enter if other => {
                 let t = self.inp.trim().to_string();
                 if t.is_empty() {
@@ -1403,6 +1456,9 @@ impl App {
                 v.push(t);
                 self.qnext(v.join(", "));
             }
+            KeyCode::Enter if !idle && !nav => {
+                self.toast("question open  ·  ↑↓ to pick an answer, esc to dismiss")
+            }
             KeyCode::Enter => {
                 let a = if cur.multi {
                     let v: Vec<String> = cur
@@ -1422,7 +1478,7 @@ impl App {
                 };
                 self.qnext(a);
             }
-            _ => return !other,
+            _ => return false,
         }
         true
     }
@@ -1581,10 +1637,7 @@ impl App {
     pub fn setdefmode(&mut self, i: usize) {
         if self.lv.is_some() || self.cx.is_some() {
             let f = modefile();
-            if let Some(d) = std::path::Path::new(&f).parent() {
-                let _ = std::fs::create_dir_all(d);
-            }
-            let _ = std::fs::write(&f, MODES[i]);
+            wcfg(&f, MODES[i]);
         }
         if self.mode != i {
             self.mode = i;
@@ -1627,10 +1680,7 @@ impl App {
             return;
         }
         let f = sys::cfgfile("opacity");
-        if let Some(d) = std::path::Path::new(&f).parent() {
-            let _ = std::fs::create_dir_all(d);
-        }
-        let _ = std::fs::write(&f, v.to_string());
+        wcfg(&f, v.to_string());
         let sc = sys::opacity_scope();
         self.toast(if v == 100 || sc.is_empty() {
             format!("opacity  {v}%")
@@ -1741,6 +1791,12 @@ impl App {
                 self.ctx = 3.0;
                 self.todo.clear();
                 self.sel = None;
+                self.sb = None;
+                self.ti = None;
+                self.ask = None;
+                self.q.clear();
+                self.wait = 0;
+                self.busy = false;
             }
             "model" => {
                 self.model = (self.model + 1) % MODELS.len();
@@ -1773,6 +1829,9 @@ impl App {
 
     /// Inserts `c` at the cursor.
     pub fn ins(&mut self, c: char) {
+        if c == PSEN {
+            return;
+        }
         self.sug = None;
         self.ms = 0;
         let i = self.bi();
@@ -2208,7 +2267,10 @@ impl App {
             self.files(v);
             return;
         }
-        let s = s.replace("\r\n", "\n").replace('\r', "\n");
+        let s = s
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace(PSEN, "");
         if self.rs.is_some() {
             self.rq.push_str(s.lines().next().unwrap_or(""));
             return;
@@ -2228,11 +2290,15 @@ impl App {
                 format!("{c} chars")
             };
             let t = format!(
-                "{}[pasted #{} {d}] ",
+                "{}[{PSEN}pasted #{} {d}] ",
                 if pre { " " } else { "" },
                 self.pst.len()
             );
-            self.put(&t);
+            let i = self.bi();
+            self.inp.insert_str(i, &t);
+            self.cur += t.chars().count();
+            self.sug = None;
+            self.ms = 0;
             return;
         }
         self.put(&s);
@@ -2263,7 +2329,7 @@ impl App {
     pub fn expand(&self, s: &str) -> String {
         let mut o = String::new();
         let mut r = s;
-        while let Some(i) = r.find("[pasted #") {
+        while let Some(i) = r.find(PTAG) {
             o.push_str(&r[..i]);
             let t = &r[i..];
             match ptok(t) {
@@ -2569,18 +2635,17 @@ impl App {
         let mut o = vec![];
         for (i, l) in self.btx.borrow().iter().enumerate() {
             let cs: Vec<char> = l.chars().collect();
-            let lc: Vec<char> = cs
+            let (lc, om): (Vec<char>, Vec<usize>) = cs
                 .iter()
-                .map(|c| c.to_lowercase().next().unwrap_or(*c))
-                .collect();
+                .enumerate()
+                .flat_map(|(k, c)| c.to_lowercase().map(move |x| (x, k)))
+                .unzip();
             let mut j = 0;
             while j + q.len() <= lc.len() {
                 if lc[j..j + q.len()] == q[..] {
-                    let x: usize = cs[..j].iter().map(|c| c.width().unwrap_or(0)).sum();
-                    let w: usize = cs[j..j + q.len()]
-                        .iter()
-                        .map(|c| c.width().unwrap_or(0))
-                        .sum();
+                    let (a, b) = (om[j], om[j + q.len() - 1] + 1);
+                    let x: usize = cs[..a].iter().map(|c| c.width().unwrap_or(0)).sum();
+                    let w: usize = cs[a..b].iter().map(|c| c.width().unwrap_or(0)).sum();
                     o.push((i, x, w));
                     j += q.len();
                 } else {
@@ -2669,15 +2734,61 @@ impl App {
         }
     }
 
-    /// Clears the input box and keeps what was there in the history.
+    /// Clears the input box and keeps what was there in the history; while a history entry
+    /// is shown, the draft typed before browsing comes back instead.
     fn clearinp(&mut self) {
+        let h = self.hi.and_then(|i| self.hist.get(i)).cloned();
         let s = std::mem::take(&mut self.inp);
-        if self.hist.last() != Some(&s) {
+        if h.as_ref() != Some(&s) && !s.is_empty() && self.hist.last() != Some(&s) {
             self.hist.push(s);
         }
+        self.inp = if h.is_some() {
+            self.drf.take().unwrap_or_default()
+        } else {
+            String::new()
+        };
         self.hi = None;
         self.drf = None;
-        self.cur = 0
+        self.hed.clear();
+        self.cur = self.nch()
+    }
+
+    fn hgo(&mut self, j: Option<usize>) {
+        let s = std::mem::take(&mut self.inp);
+        match self.hi {
+            Some(i) => {
+                self.hed.retain(|x| x.0 != i);
+                if self.hist.get(i) != Some(&s) {
+                    self.hed.push((i, s));
+                }
+            }
+            None => self.drf = Some(s),
+        }
+        self.hi = j;
+        self.inp = match j {
+            Some(j) => self
+                .hed
+                .iter()
+                .find(|x| x.0 == j)
+                .map(|x| x.1.clone())
+                .or_else(|| self.hist.get(j).cloned())
+                .unwrap_or_default(),
+            None => {
+                self.hed.clear();
+                self.drf.take().unwrap_or_default()
+            }
+        };
+        self.cur = self.nch()
+    }
+
+    fn setinp(&mut self, t: String) {
+        if t != self.inp {
+            let o = std::mem::replace(&mut self.inp, t);
+            self.snap((o, self.cur));
+            self.red.clear();
+            self.uk = false;
+        }
+        self.cur = self.nch();
     }
 
     /// Ctrl+C as in Claude Code: the first press interrupts a running turn or clears the
@@ -2709,6 +2820,7 @@ impl App {
     }
 
     fn key0(&mut self, k: KeyEvent) {
+        self.dlgsync();
         let ct = k.modifiers.contains(Km::CONTROL);
         if ct && k.code == KeyCode::Char('c') {
             self.ctrlc();
@@ -2947,7 +3059,9 @@ impl App {
             KeyCode::Enter if k.modifiers.intersects(Km::SHIFT | Km::ALT) => self.ins('\n'),
             KeyCode::Enter => {
                 if self.ask.is_some() && self.inp.is_empty() {
-                    self.answer('y')
+                    if self.armed() {
+                        self.answer('y')
+                    }
                 } else {
                     self.submit()
                 }
@@ -2956,6 +3070,7 @@ impl App {
                 if !ct
                     && self.ask.is_some()
                     && self.inp.is_empty()
+                    && self.armed()
                     && matches!(c, 'y' | 'n' | 'a') =>
             {
                 self.answer(c)
@@ -3078,25 +3193,19 @@ impl App {
                 }
                 let i = match self.hi {
                     None => {
-                        self.drf = Some(self.inp.clone());
+                        if !self.inp.is_empty() {
+                            self.snap((self.inp.clone(), self.cur));
+                            self.red.clear();
+                        }
                         self.hist.len() - 1
                     }
                     Some(i) => i.saturating_sub(1),
                 };
-                self.hi = Some(i);
-                self.inp = self.hist[i].clone();
-                self.cur = self.nch()
+                self.hgo(Some(i));
             }
             KeyCode::Down => {
                 if let Some(i) = self.hi {
-                    if i + 1 < self.hist.len() {
-                        self.hi = Some(i + 1);
-                        self.inp = self.hist[i + 1].clone();
-                    } else {
-                        self.hi = None;
-                        self.inp = self.drf.take().unwrap_or_default();
-                    }
-                    self.cur = self.nch()
+                    self.hgo((i + 1 < self.hist.len()).then_some(i + 1));
                 }
             }
             KeyCode::PageUp => self.scr = (self.scr + 10).min(self.smax.get()),
@@ -3260,7 +3369,7 @@ fn tokend(cs: &[char]) -> Option<usize> {
 
 /// Reads a `[pasted #N]` token at the start of `s` as (N, length in characters).
 pub fn ptok(s: &str) -> Option<(usize, usize)> {
-    let r = s.strip_prefix("[pasted #")?;
+    let r = s.strip_prefix(PTAG)?;
     let d: String = r.chars().take_while(|c| c.is_ascii_digit()).collect();
     if d.is_empty() {
         return None;
@@ -3272,8 +3381,11 @@ pub fn ptok(s: &str) -> Option<(usize, usize)> {
     if r[d.len()..].chars().nth(e) != Some(']') {
         return None;
     }
-    Some((d.parse().ok()?, 9 + d.len() + e + 1))
+    Some((d.parse().ok()?, PTAG.chars().count() + d.len() + e + 1))
 }
+
+const PSEN: char = '\u{2060}';
+const PTAG: &str = "[\u{2060}pasted #";
 
 /// Reads an image or pasted token at the start of `s` as (N, length in characters).
 pub fn atok(s: &str) -> Option<(usize, usize)> {
@@ -3301,7 +3413,7 @@ pub fn imgspans(s: &str, base: Style, hi: Style) -> Vec<Span<'static>> {
                 v.push(Span::styled(std::mem::take(&mut cur), base));
             }
             let b: usize = rest.chars().take(l).map(char::len_utf8).sum();
-            v.push(Span::styled(rest[..b].to_string(), hi));
+            v.push(Span::styled(rest[..b].replace(PSEN, ""), hi));
             rest = &rest[b..];
         } else {
             let Some(c) = rest.chars().next() else { break };
@@ -3979,6 +4091,7 @@ pub fn run<T: V + Clone>(mut v: T) -> io::Result<()> {
     if args.len() > 1 && args[1] == "--dump" {
         return dump(&mut v, &args[2..]);
     }
+    sys::on_close(bye);
     enable_raw_mode()?;
     TERM_ON.store(true, std::sync::atomic::Ordering::SeqCst);
     let mut out = io::stdout();
@@ -4084,7 +4197,6 @@ fn lp<T: V>(term: &mut Terminal<CrosstermBackend<io::Stdout>>, v: &mut T) -> io:
     let mut pv: Option<u64> = None;
     let mut sk = 0u32;
     let shot = std::env::var("NONAME_SHOT").ok();
-    sys::on_close(bye);
     sys::catch_ctrlc(true);
     upd::cleanup();
     if std::env::var("NONAME_MOCK").is_err()
@@ -4094,9 +4206,16 @@ fn lp<T: V>(term: &mut Terminal<CrosstermBackend<io::Stdout>>, v: &mut T) -> io:
     {
         a.upcheck(false);
     }
+    let st = Instant::now();
+    let mut done = 0u64;
+    let mut rz = false;
     while !a.quit {
         a.cp.set(None);
         term.autoresize()?;
+        if std::mem::take(&mut rz) {
+            term.clear()?;
+            pv = None;
+        }
         {
             let mut f = term.get_frame();
             v.draw(&mut f, &a);
@@ -4156,8 +4275,7 @@ fn lp<T: V>(term: &mut Terminal<CrosstermBackend<io::Stdout>>, v: &mut T) -> io:
         if a.edit {
             a.edit = false;
             if let Some(t) = editor(&a.inp) {
-                a.inp = t.trim_end_matches('\n').to_string();
-                a.cur = a.inp.chars().count();
+                a.setinp(t.trim_end_matches('\n').to_string());
             }
             term.clear()?;
             pv = None;
@@ -4166,10 +4284,37 @@ fn lp<T: V>(term: &mut Terminal<CrosstermBackend<io::Stdout>>, v: &mut T) -> io:
             a.key(KeyEvent::new(KeyCode::Char('c'), Km::CONTROL));
         }
         let slow = sk >= 15 && !a.seld;
-        let t0 = Instant::now();
-        let dl = t0 + Duration::from_millis(if slow { 250 } else { 33 });
-        while event::poll(dl.saturating_duration_since(Instant::now()))? {
-            match event::read()? {
+        let dl = if slow {
+            Instant::now() + Duration::from_millis(250)
+        } else {
+            st + Duration::from_millis((done + 1) * 33)
+        };
+        let mut nx: VecDeque<Event> = VecDeque::new();
+        while !nx.is_empty() || event::poll(dl.saturating_duration_since(Instant::now()))? {
+            let ev = match nx.pop_front() {
+                Some(e) => e,
+                None => event::read()?,
+            };
+            #[cfg(windows)]
+            let ev = if nx.is_empty()
+                && a.rw.is_none()
+                && a.ns.is_none()
+                && a.pp.is_none()
+                && a.tp.is_none()
+                && a.bp.is_none()
+            {
+                burst(ev, &mut nx, &mut || {
+                    if event::poll(Duration::ZERO)? {
+                        event::read().map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                })?
+            } else {
+                ev
+            };
+            match ev {
+                Event::Resize(..) => rz = true,
                 Event::Key(k) if k.kind != KeyEventKind::Release => {
                     let k = altgr(k);
                     a.dn = false;
@@ -4327,7 +4472,7 @@ fn lp<T: V>(term: &mut Terminal<CrosstermBackend<io::Stdout>>, v: &mut T) -> io:
                 },
                 _ => {}
             }
-            if a.quit || slow {
+            if a.quit || ((slow || rz) && nx.is_empty()) {
                 break;
             }
         }
@@ -4353,9 +4498,11 @@ fn lp<T: V>(term: &mut Terminal<CrosstermBackend<io::Stdout>>, v: &mut T) -> io:
                 a.bgw = bg::canon(v[(a.t / 30) as usize % v.len()]);
             }
         }
-        for _ in 0..(t0.elapsed().as_millis() / 33).clamp(1, 10) {
+        let due = (st.elapsed().as_millis() / 33) as u64;
+        for _ in 0..due.saturating_sub(done).min(10) {
             a.step();
         }
+        done = due;
         if std::env::var("NONAME_MOCK").is_err() {
             let sid = a.session_id();
             if let Ok(mut s) = SID.lock() {
@@ -4374,6 +4521,60 @@ fn lp<T: V>(term: &mut Terminal<CrosstermBackend<io::Stdout>>, v: &mut T) -> io:
     } else {
         a.session_id()
     })
+}
+
+#[cfg(any(windows, test))]
+fn burst(
+    e: Event,
+    nx: &mut VecDeque<Event>,
+    more: &mut dyn FnMut() -> io::Result<Option<Event>>,
+) -> io::Result<Event> {
+    let Some(Some(c)) = pkey(&e) else {
+        return Ok(e);
+    };
+    let mut s = String::from(c);
+    let mut n = 1;
+    let mut v = vec![];
+    let mut end = None;
+    while let Some(x) = more()? {
+        match pkey(&x) {
+            Some(Some(c)) => {
+                s.push(c);
+                n += 1;
+                v.push(x);
+            }
+            Some(None) => v.push(x),
+            None => {
+                end = Some(x);
+                break;
+            }
+        }
+    }
+    if n >= 3 {
+        nx.extend(end);
+        return Ok(Event::Paste(s));
+    }
+    nx.extend(v);
+    nx.extend(end);
+    Ok(e)
+}
+
+#[cfg(any(windows, test))]
+fn pkey(e: &Event) -> Option<Option<char>> {
+    let Event::Key(k) = e else { return None };
+    if k.kind == KeyEventKind::Release {
+        return Some(None);
+    }
+    let k = altgr(*k);
+    if !k.modifiers.difference(Km::SHIFT).is_empty() {
+        return None;
+    }
+    match k.code {
+        KeyCode::Char(c) => Some(Some(c)),
+        KeyCode::Enter => Some(Some('\n')),
+        KeyCode::Tab => Some(Some('\t')),
+        _ => None,
+    }
 }
 
 /// Session id for the exit message, also when noname is ended by a signal.
@@ -4411,6 +4612,9 @@ fn selhl(
     }
     let ((y0, x0), (y1, x1)) = selnorm(s);
     let ar = b.area;
+    if ar.width == 0 || ar.height == 0 {
+        return;
+    }
     for y in y0..=y1.min(ar.height.saturating_sub(1)) {
         let xa = if y == y0 { x0 } else { 0 };
         let xb = if y == y1 {
@@ -4431,6 +4635,9 @@ fn selhl(
 fn seltext(b: &ratatui::buffer::Buffer, s: (u16, u16, u16, u16)) -> String {
     let ((y0, x0), (y1, x1)) = selnorm(s);
     let ar = b.area;
+    if ar.width == 0 || ar.height == 0 {
+        return String::new();
+    }
     let mut ls: Vec<String> = vec![];
     for y in y0..=y1.min(ar.height.saturating_sub(1)) {
         let xa = if y == y0 { x0 } else { 0 };
@@ -4462,7 +4669,7 @@ fn tidy(ls: Vec<String>) -> String {
         .iter()
         .skip(1)
         .filter(|l| !l.is_empty())
-        .map(|l| l.len() - l.trim_start().len())
+        .map(|l| l.chars().take_while(|c| c.is_whitespace()).count())
         .min()
         .unwrap_or(0);
     let mut o: Vec<String> = ls
@@ -4472,7 +4679,7 @@ fn tidy(ls: Vec<String>) -> String {
             if i == 0 {
                 l.trim_start().to_string()
             } else {
-                l.get(ind.min(l.len())..).unwrap_or("").to_string()
+                l.chars().skip(ind).collect()
             }
         })
         .collect();
@@ -4483,9 +4690,10 @@ fn tidy(ls: Vec<String>) -> String {
 }
 
 fn copy(t: &str) -> bool {
+    let t = t.replace(PSEN, "");
     let _ = write!(io::stdout(), "\x1b]52;c;{}\x07", img::b64(t.as_bytes()));
     let _ = io::stdout().flush();
-    sys::setclip(t)
+    sys::setclip(&t)
 }
 
 fn cur_label(q: &Option<Qa>, j: usize) -> String {
@@ -4504,29 +4712,40 @@ pub fn bars() -> [bool; 3] {
     use std::sync::atomic::Ordering::Relaxed;
     let mut m = BSET.load(Relaxed);
     if m == u8::MAX {
-        let hid = std::fs::read_to_string(sys::cfgfile("bars")).unwrap_or_default();
-        m = (0..3)
-            .filter(|&i| !hid.split([',', '\n', ' ']).any(|x| x.trim() == BKEY[i]))
-            .fold(0, |a, i| a | 1 << i);
+        m = bmask(&std::fs::read_to_string(sys::cfgfile("bars")).unwrap_or_default());
         BSET.store(m, Relaxed);
     }
     [m & 1 != 0, m & 2 != 0, m & 4 != 0]
 }
 
+fn bmask(hid: &str) -> u8 {
+    (0..3)
+        .filter(|&i| !hid.split([',', '\n', ' ']).any(|x| x.trim() == BKEY[i]))
+        .fold(0, |a, i| a | 1 << i)
+}
+
+fn hidset(cur: &str, k: &str, on: bool) -> String {
+    let mut v: Vec<&str> = cur
+        .split([',', '\n', ' '])
+        .map(str::trim)
+        .filter(|x| !x.is_empty() && *x != k)
+        .collect();
+    if !on {
+        v.push(k);
+    }
+    v.join(",")
+}
+
 /// Turns footer bar `i` on or off and saves the choice.
 pub fn setbar(i: usize, on: bool) {
-    let mut b = bars();
-    b[i] = on;
-    BSET.store(
-        (0..3).filter(|&j| b[j]).fold(0, |a, j| a | 1 << j),
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    let hid: Vec<&str> = (0..3).filter(|&j| !b[j]).map(|j| BKEY[j]).collect();
     let f = sys::cfgfile("bars");
-    if let Some(d) = std::path::Path::new(&f).parent() {
-        let _ = std::fs::create_dir_all(d);
-    }
-    let _ = std::fs::write(&f, hid.join(","));
+    let hid = hidset(
+        &std::fs::read_to_string(&f).unwrap_or_default(),
+        BKEY[i],
+        on,
+    );
+    BSET.store(bmask(&hid), std::sync::atomic::Ordering::Relaxed);
+    wcfg(&f, hid);
 }
 
 /// Layout settings as (name, choices), indexed as in `lay`; the first choice is the default.
@@ -4571,9 +4790,11 @@ static LSET: [std::sync::atomic::AtomicU8; 6] =
     [const { std::sync::atomic::AtomicU8::new(u8::MAX) }; 6];
 
 fn layload() -> Vec<(String, String)> {
-    std::fs::read_to_string(sys::cfgfile("layout"))
-        .unwrap_or_default()
-        .lines()
+    laypairs(&std::fs::read_to_string(sys::cfgfile("layout")).unwrap_or_default())
+}
+
+fn laypairs(s: &str) -> Vec<(String, String)> {
+    s.lines()
         .filter_map(|l| l.split_once('='))
         .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
         .collect()
@@ -4596,17 +4817,29 @@ pub fn lay(i: usize) -> usize {
     v
 }
 
-/// Chooses option `v` for layout setting `i` and saves all layout settings.
+fn layset(cur: &str, k: &str, v: &str) -> String {
+    let mut kv = laypairs(cur);
+    match kv.iter_mut().find(|x| x.0 == k) {
+        Some(x) => x.1 = v.to_string(),
+        None => kv.push((k.to_string(), v.to_string())),
+    }
+    kv.iter().map(|(k, v)| format!("{k}={v}\n")).collect()
+}
+
+/// Chooses option `v` for layout setting `i` and saves it, keeping the other saved layout settings.
 pub fn setlay(i: usize, v: usize) {
     LSET[i].store(v as u8, std::sync::atomic::Ordering::Relaxed);
-    let body: String = (0..LAYOUT.len())
-        .map(|j| format!("{}={}\n", LAYOUT[j].0, LAYOUT[j].1[lay(j)]))
-        .collect();
     let f = sys::cfgfile("layout");
-    if let Some(d) = std::path::Path::new(&f).parent() {
+    let (k, opts) = LAYOUT[i];
+    let body = layset(&std::fs::read_to_string(&f).unwrap_or_default(), k, opts[v]);
+    wcfg(&f, body);
+}
+
+fn wcfg(f: &str, b: impl AsRef<[u8]>) {
+    if let Some(d) = std::path::Path::new(f).parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    let _ = std::fs::write(&f, body);
+    let _ = sys::save(f, b);
 }
 
 /// Path of the file that stores the default permission mode.
@@ -4645,10 +4878,7 @@ pub fn rclick() -> bool {
 pub fn setrclick(on: bool) {
     RCLICK.store(on as u8, std::sync::atomic::Ordering::Relaxed);
     let f = sys::cfgfile("rclick");
-    if let Some(d) = std::path::Path::new(&f).parent() {
-        let _ = std::fs::create_dir_all(d);
-    }
-    let _ = std::fs::write(&f, if on { "on" } else { "off" });
+    wcfg(&f, if on { "on" } else { "off" });
 }
 
 /// The saved default effort, or `None` to leave it to Claude.
@@ -4662,10 +4892,7 @@ pub fn setdefeff(e: Option<&str>) {
     let f = sys::cfgfile("effort");
     match e {
         Some(e) => {
-            if let Some(d) = std::path::Path::new(&f).parent() {
-                let _ = std::fs::create_dir_all(d);
-            }
-            let _ = std::fs::write(&f, e);
+            wcfg(&f, e);
         }
         None => {
             let _ = std::fs::remove_file(&f);
@@ -4719,6 +4946,7 @@ fn editor(s: &str) -> Option<String> {
                 "vi".into()
             }
         });
+    sys::hold_int(true);
     let _ = restore();
     let mut v = ed.split_whitespace();
     let ok = std::process::Command::new(v.next().unwrap_or("vi"))
@@ -4739,6 +4967,7 @@ fn editor(s: &str) -> Option<String> {
     );
     let _ = execute!(out, ratatui::crossterm::event::EnableBracketedPaste);
     TERM_ON.store(true, std::sync::atomic::Ordering::SeqCst);
+    sys::hold_int(false);
     let r = if ok {
         std::fs::read_to_string(&f).ok()
     } else {
@@ -4750,6 +4979,8 @@ fn editor(s: &str) -> Option<String> {
 
 /// Ticks (~33 ms) in which a second Ctrl+C exits: as long as the "press again" toast shows.
 const CC_WIN: u64 = 60;
+
+const QGRACE: u64 = 15;
 
 #[cfg(test)]
 mod ctrlc_tests {
@@ -5324,5 +5555,402 @@ mod md_tests {
     fn short_code_lines_stay_whole() {
         let ls = md("```\n  let x = 1;\n\n```", 80, &mdt());
         assert_eq!(text(&ls[0]), "  |   let x = 1;");
+    }
+}
+
+#[cfg(test)]
+mod fix_tests {
+    use super::*;
+
+    #[test]
+    fn setting_writes_keep_other_keys() {
+        assert_eq!(
+            layset("input=top\nmodel=off\n", "model", "bottom"),
+            "input=top\nmodel=bottom\n"
+        );
+        assert_eq!(
+            layset("input=top\n", "title", "top left"),
+            "input=top\ntitle=top left\n"
+        );
+        assert_eq!(hidset("5h", "week", false), "5h,week");
+        assert_eq!(hidset("5h,week", "5h", true), "week");
+        assert_eq!(hidset("", "context", true), "");
+        assert_eq!(bmask("5h,week"), 1);
+    }
+
+    #[test]
+    fn wcfg_writes_atomically() {
+        let d = std::env::temp_dir().join(format!("noname-wcfg-{}", std::process::id()));
+        let f = d.join("sub").join("x");
+        let fs = f.to_string_lossy().to_string();
+        wcfg(&fs, "a");
+        wcfg(&fs, "b");
+        assert_eq!(std::fs::read_to_string(&f).ok().as_deref(), Some("b"));
+        let n = std::fs::read_dir(d.join("sub"))
+            .map(|r| r.count())
+            .unwrap_or(0);
+        assert_eq!(n, 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn tidy_counts_indent_in_chars() {
+        let ls = vec![
+            "a".to_string(),
+            "\u{3000}\u{3000}x".to_string(),
+            "  y".to_string(),
+        ];
+        assert_eq!(tidy(ls), "a\nx\ny");
+        assert_eq!(
+            tidy(vec!["a".into(), "    b".into(), "  c".into()]),
+            "a\n  b\nc"
+        );
+    }
+
+    #[test]
+    fn find_folds_case_like_the_query() {
+        let a = App::new();
+        *a.btx.borrow_mut() = vec!["xİy İ".into(), "ABC abc".into()];
+        let mut a = a;
+        a.fs = Some(("İ".into(), 0));
+        assert_eq!(a.fhits(), vec![(0, 1, 1), (0, 4, 1)]);
+        a.fs = Some(("y".into(), 0));
+        assert_eq!(a.fhits(), vec![(0, 2, 1)]);
+        a.fs = Some(("bc".into(), 0));
+        assert_eq!(a.fhits(), vec![(1, 1, 2), (1, 5, 2)]);
+    }
+
+    #[test]
+    fn selection_on_empty_buffer_does_not_panic() {
+        for (w, h) in [(0, 0), (0, 5), (5, 0)] {
+            let mut b = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, w, h));
+            selhl(&mut b, Some((0, 0, 3, 2)), None);
+            assert_eq!(seltext(&b, (0, 0, 3, 2)), "");
+        }
+    }
+
+    fn kc(a: &mut App, c: KeyCode) {
+        a.key(KeyEvent::new(c, Km::NONE));
+    }
+
+    fn typ(a: &mut App, s: &str) {
+        for c in s.chars() {
+            kc(a, KeyCode::Char(c));
+        }
+    }
+
+    fn happ() -> App {
+        let mut a = App::new();
+        a.hist = vec!["one".into(), "two".into()];
+        a
+    }
+
+    #[test]
+    fn esc_out_of_history_restores_the_draft() {
+        let mut a = happ();
+        typ(&mut a, "draft");
+        kc(&mut a, KeyCode::Up);
+        assert_eq!(a.inp, "two");
+        kc(&mut a, KeyCode::Esc);
+        assert_eq!((a.inp.as_str(), a.cur), ("draft", 5));
+        assert_eq!(a.hist, ["one", "two"]);
+        kc(&mut a, KeyCode::Up);
+        a.key(KeyEvent::new(KeyCode::Char('c'), Km::CONTROL));
+        assert_eq!(a.inp, "draft");
+        assert!(!a.quit);
+    }
+
+    #[test]
+    fn down_past_newest_and_undo_restore_the_draft() {
+        let mut a = happ();
+        typ(&mut a, "draft");
+        kc(&mut a, KeyCode::Up);
+        kc(&mut a, KeyCode::Up);
+        assert_eq!(a.inp, "one");
+        kc(&mut a, KeyCode::Down);
+        kc(&mut a, KeyCode::Down);
+        assert_eq!(a.inp, "draft");
+        kc(&mut a, KeyCode::Up);
+        a.key(KeyEvent::new(KeyCode::Char('z'), Km::CONTROL));
+        assert_eq!(a.inp, "draft");
+    }
+
+    #[test]
+    fn submit_from_history_keeps_the_draft() {
+        let mut a = happ();
+        typ(&mut a, "draft");
+        kc(&mut a, KeyCode::Up);
+        a.submit();
+        assert_eq!(a.hist.last().map(String::as_str), Some("two"));
+        assert_eq!(a.inp, "draft");
+        a.inp.clear();
+        a.cur = 0;
+        kc(&mut a, KeyCode::Up);
+        kc(&mut a, KeyCode::Down);
+        assert_eq!(a.inp, "");
+    }
+
+    #[test]
+    fn edits_to_history_entries_survive_browsing() {
+        let mut a = happ();
+        kc(&mut a, KeyCode::Up);
+        typ(&mut a, "!");
+        assert_eq!(a.inp, "two!");
+        kc(&mut a, KeyCode::Up);
+        assert_eq!(a.inp, "one");
+        kc(&mut a, KeyCode::Down);
+        assert_eq!(a.inp, "two!");
+        kc(&mut a, KeyCode::Esc);
+        assert_eq!(a.inp, "");
+        assert_eq!(a.hist, ["one", "two", "two!"]);
+    }
+
+    #[test]
+    fn external_edit_is_one_undo_step() {
+        let mut a = App::new();
+        typ(&mut a, "abc");
+        a.setinp("xyz\nmore".into());
+        assert_eq!((a.inp.as_str(), a.cur), ("xyz\nmore", 8));
+        a.key(KeyEvent::new(KeyCode::Char('z'), Km::CONTROL));
+        assert_eq!(a.inp, "abc");
+    }
+
+    #[test]
+    fn only_real_paste_tokens_expand() {
+        let mut a = App::new();
+        let big: String = (0..10).map(|i| format!("l{i}\n")).collect();
+        a.paste(big.clone());
+        typ(&mut a, "and [pasted #1 +10 lines] literal");
+        let x = a.expand(&a.inp);
+        assert_eq!(x.matches("l9").count(), 1);
+        assert!(x.contains("[pasted #1 +10 lines] literal"));
+        assert!(x.starts_with(&big));
+        let shown: String = imgspans(&a.inp, Style::default(), Style::default())
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(!shown.contains(PSEN));
+        let n = a.inp.chars().count();
+        a.paste(a.inp.clone());
+        assert_eq!(a.expand(&a.inp).matches("l9").count(), 1);
+        assert_eq!(a.inp.chars().count(), 2 * n - 1);
+        a.inp.clear();
+        a.cur = 0;
+        a.key(KeyEvent::new(KeyCode::Char(PSEN), Km::NONE));
+        typ(&mut a, "[pasted #1 x]");
+        assert_eq!(a.expand(&a.inp), "[pasted #1 x]");
+        assert_eq!(a.tokl(), None);
+    }
+
+    #[test]
+    fn paste_token_is_one_unit_for_the_cursor() {
+        let mut a = App::new();
+        a.paste("a\nb\nc\nd\ne\nf".into());
+        let t = a.inp.trim_end().to_string();
+        assert_eq!(ptok(&t).map(|x| x.1), Some(t.chars().count()));
+        kc(&mut a, KeyCode::Left);
+        kc(&mut a, KeyCode::Backspace);
+        assert_eq!(a.inp, " ");
+    }
+
+    fn qa(id: &str) -> Qa {
+        Qa {
+            id: id.into(),
+            inp: serde_json::Value::Null,
+            qs: vec![Qq {
+                q: "Ready to code?".into(),
+                h: "plan".into(),
+                opts: (1..=4)
+                    .map(|i| (format!("opt{i}"), String::new()))
+                    .collect(),
+                multi: false,
+            }],
+            i: 0,
+            sel: 0,
+            pick: vec![false; 4],
+            ans: vec![],
+            plan: true,
+        }
+    }
+
+    #[test]
+    fn typing_does_not_answer_a_dialog_that_pops_up() {
+        let mut a = App::new();
+        a.t = 100;
+        typ(&mut a, "fix the");
+        a.qa = Some(qa("r1"));
+        a.step();
+        typ(&mut a, " 3");
+        assert!(a.qa.is_some());
+        assert_eq!(a.inp, "fix the 3");
+        a.t += QGRACE;
+        typ(&mut a, "2");
+        kc(&mut a, KeyCode::Enter);
+        assert!(a.qa.is_some());
+        assert_eq!(a.inp, "fix the 32");
+        kc(&mut a, KeyCode::Esc);
+        assert!(a.qa.is_none());
+        assert_eq!(a.inp, "fix the 32");
+    }
+
+    #[test]
+    fn dialog_answers_only_after_the_grace_period() {
+        let mut a = App::new();
+        a.t = 100;
+        a.qa = Some(qa("r2"));
+        typ(&mut a, "3");
+        kc(&mut a, KeyCode::Enter);
+        kc(&mut a, KeyCode::Down);
+        assert!(a.qa.as_ref().is_some_and(|q| q.sel == 0));
+        assert_eq!(a.inp, "3");
+        kc(&mut a, KeyCode::Esc);
+        assert!(a.qa.is_some());
+        assert_eq!(a.inp, "");
+        a.t += QGRACE;
+        kc(&mut a, KeyCode::Down);
+        kc(&mut a, KeyCode::Enter);
+        assert!(a.qa.is_none());
+        assert!(matches!(a.bs.last(), Some(B::Qa(_, x)) if x == "opt2"));
+        a.t += 1;
+        a.qa = Some(qa("r3"));
+        a.step();
+        a.t += QGRACE;
+        typ(&mut a, "3");
+        assert!(a.qa.is_none());
+        assert!(matches!(a.bs.last(), Some(B::Qa(_, x)) if x == "opt3"));
+    }
+
+    #[test]
+    fn dialog_with_draft_answers_after_navigation() {
+        let mut a = App::new();
+        a.t = 100;
+        typ(&mut a, "draft");
+        a.qa = Some(qa("r4"));
+        a.step();
+        a.t += QGRACE;
+        kc(&mut a, KeyCode::Enter);
+        assert!(a.qa.is_some());
+        kc(&mut a, KeyCode::Down);
+        kc(&mut a, KeyCode::Enter);
+        assert!(a.qa.is_none());
+        assert_eq!(a.inp, "draft");
+    }
+
+    #[test]
+    fn permission_prompt_has_a_grace_period() {
+        let mut a = App::new();
+        a.t = 100;
+        a.bs.push(B::Ask(Ask {
+            cmd: "git push".into(),
+            ans: None,
+        }));
+        a.ask = Some(a.bs.len() - 1);
+        a.step();
+        kc(&mut a, KeyCode::Enter);
+        typ(&mut a, "y");
+        assert!(a.ask.is_some());
+        assert_eq!(a.inp, "y");
+        a.inp.clear();
+        a.cur = 0;
+        a.t += QGRACE;
+        typ(&mut a, "n");
+        assert!(a.ask.is_none());
+    }
+
+    fn kev(c: KeyCode, rel: bool) -> Event {
+        let mut k = KeyEvent::new(c, Km::NONE);
+        if rel {
+            k.kind = KeyEventKind::Release;
+        }
+        Event::Key(k)
+    }
+
+    fn run_burst(v: Vec<Event>) -> (Event, VecDeque<Event>) {
+        let mut it = v.into_iter();
+        let e = it.next().unwrap_or(Event::FocusGained);
+        let mut nx = VecDeque::new();
+        let r = burst(e, &mut nx, &mut || Ok(it.next()));
+        (r.unwrap_or(Event::FocusLost), nx)
+    }
+
+    #[test]
+    fn key_bursts_become_one_paste() {
+        let mut v = vec![];
+        for c in "y\nno".chars() {
+            let k = if c == '\n' {
+                KeyCode::Enter
+            } else {
+                KeyCode::Char(c)
+            };
+            v.push(kev(k, false));
+            v.push(kev(k, true));
+        }
+        v.push(Event::FocusGained);
+        let (e, nx) = run_burst(v);
+        assert_eq!(e, Event::Paste("y\nno".into()));
+        assert_eq!(nx, [Event::FocusGained]);
+        let (e, nx) = run_burst(vec![
+            kev(KeyCode::Char('a'), false),
+            kev(KeyCode::Char('a'), true),
+            kev(KeyCode::Enter, false),
+        ]);
+        assert_eq!(e, kev(KeyCode::Char('a'), false));
+        assert_eq!(nx.len(), 2);
+        let (e, nx) = run_burst(vec![
+            kev(KeyCode::Up, false),
+            kev(KeyCode::Char('a'), false),
+        ]);
+        assert_eq!(e, kev(KeyCode::Up, false));
+        assert!(nx.is_empty());
+        let mut a = App::new();
+        a.bs.push(B::Ask(Ask {
+            cmd: "x".into(),
+            ans: None,
+        }));
+        a.ask = Some(0);
+        a.t = 100;
+        a.step();
+        a.t += QGRACE;
+        if let Event::Paste(s) = run_burst(vec![
+            kev(KeyCode::Char('a'), false),
+            kev(KeyCode::Enter, false),
+            kev(KeyCode::Char('b'), false),
+        ])
+        .0
+        {
+            a.paste(s);
+        }
+        assert!(a.ask.is_some());
+        assert_eq!(a.inp, "a\nb");
+    }
+
+    #[test]
+    fn mock_clear_mid_turn_resets_indexes() {
+        let mut a = App::new();
+        a.inp = "go".into();
+        a.submit();
+        for _ in 0..400 {
+            a.step();
+            if a.ti.is_some() || a.sb.is_some() {
+                break;
+            }
+        }
+        assert!(a.ti.is_some() || a.sb.is_some());
+        a.cmd("clear");
+        assert!(a.ti.is_none() && a.sb.is_none() && a.ask.is_none());
+        for _ in 0..50 {
+            a.step();
+        }
+        a.answer('y');
+        a.stop();
+        a.inp = "again".into();
+        a.submit();
+        for _ in 0..2000 {
+            a.step();
+            if a.ask.is_some() {
+                a.cmd("clear");
+                a.answer('y');
+            }
+        }
     }
 }

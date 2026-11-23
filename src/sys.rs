@@ -276,7 +276,10 @@ pub fn on_close(f: fn()) {
     use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
     if let Ok(mut sg) = signal_hook::iterator::Signals::new([SIGHUP, SIGTERM, SIGINT]) {
         std::thread::spawn(move || {
-            if sg.forever().next().is_some() {
+            while let Some(s) = sg.forever().next() {
+                if s == SIGINT && HOLD.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
                 std::thread::spawn(move || {
                     let _ = std::panic::catch_unwind(f);
                     exit_now();
@@ -290,6 +293,16 @@ pub fn on_close(f: fn()) {
             }
         });
     }
+}
+
+#[cfg(unix)]
+static HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn hold_int(on: bool) {
+    #[cfg(unix)]
+    HOLD.store(on, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(not(unix))]
+    let _ = on;
 }
 
 /// Registers a console control handler that runs the cleanup `f` and then exits. Ctrl+C is only passed to the main loop while that is enabled.
