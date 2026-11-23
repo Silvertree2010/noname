@@ -1090,54 +1090,54 @@ impl App {
         self.t += 1;
         self.dlgsync();
         self.fpoll();
-        if let Some((s, true)) = self.tk {
-            if self.t >= self.tkp + 30 {
-                self.tkp = self.t;
-                self.tpoll(s);
-            }
+        if let Some((s, true)) = self.tk
+            && self.t >= self.tkp + 30
+        {
+            self.tkp = self.t;
+            self.tpoll(s);
         }
         self.frpoll();
         self.clpoll();
         #[cfg(feature = "voice")]
         self.vpoll();
-        if let Some(r) = &self.upr {
-            if let Ok(u) = r.try_recv() {
-                self.upr = None;
-                let f = self.upf;
-                self.upf = false;
-                match u {
-                    upd::Up::Current => {
-                        self.ups = "up to date".into();
-                        if f {
-                            self.toast("noname is up to date");
-                        }
+        if let Some(r) = &self.upr
+            && let Ok(u) = r.try_recv()
+        {
+            self.upr = None;
+            let f = self.upf;
+            self.upf = false;
+            match u {
+                upd::Up::Current => {
+                    self.ups = "up to date".into();
+                    if f {
+                        self.toast("noname is up to date");
                     }
-                    upd::Up::Ready(r) => {
-                        self.ups = format!("{r} installed, restart to use");
-                        self.bs.push(B::Sys(format!(
-                            "noname updated to {r}  ·  restart to use it"
-                        )));
+                }
+                upd::Up::Ready(r) => {
+                    self.ups = format!("{r} installed, restart to use");
+                    self.bs.push(B::Sys(format!(
+                        "noname updated to {r}  ·  restart to use it"
+                    )));
+                }
+                upd::Up::Skip(m) | upd::Up::Fail(m) => {
+                    if f {
+                        self.toast(format!("update  {m}"));
                     }
-                    upd::Up::Skip(m) | upd::Up::Fail(m) => {
-                        if f {
-                            self.toast(format!("update  {m}"));
-                        }
-                        self.ups = m;
-                    }
+                    self.ups = m;
                 }
             }
         }
-        if let Some(b) = &mut self.btw {
-            if !b.done() {
-                let mut r = b.full[b.a.len()..].to_string();
-                let c = take(&mut r, 3);
-                b.a.push_str(&c);
-            }
+        if let Some(b) = &mut self.btw
+            && !b.done()
+        {
+            let mut r = b.full[b.a.len()..].to_string();
+            let c = take(&mut r, 3);
+            b.a.push_str(&c);
         }
-        if let Some((_, t)) = &self.toast {
-            if self.t > *t {
-                self.toast = None;
-            }
+        if let Some((_, t)) = &self.toast
+            && self.t > *t
+        {
+            self.toast = None;
         }
         if self.lv.is_some() {
             self.pump();
@@ -1190,11 +1190,11 @@ impl App {
                 self.q.push_front(Sp::Fin);
             }
             Sp::Fin => {
-                if let Some(i) = self.ti.take() {
-                    if let Some(B::Tl(t)) = self.bs.get_mut(i) {
-                        t.st = if self.tf { St::Err } else { St::Ok };
-                        t.t1 = self.t;
-                    }
+                if let Some(i) = self.ti.take()
+                    && let Some(B::Tl(t)) = self.bs.get_mut(i)
+                {
+                    t.st = if self.tf { St::Err } else { St::Ok };
+                    t.t1 = self.t;
                 }
                 self.tf = false;
                 self.wait = 6;
@@ -1278,17 +1278,17 @@ impl App {
         }
         self.q.clear();
         self.wait = 0;
-        if let Some(i) = self.ti.take() {
-            if let Some(B::Tl(t)) = self.bs.get_mut(i) {
-                t.st = St::Err;
-                t.t1 = self.t;
-                t.sum = "interrupted".into();
-            }
+        if let Some(i) = self.ti.take()
+            && let Some(B::Tl(t)) = self.bs.get_mut(i)
+        {
+            t.st = St::Err;
+            t.t1 = self.t;
+            t.sum = "interrupted".into();
         }
-        if let Some(i) = self.ask.take() {
-            if let Some(B::Ask(a)) = self.bs.get_mut(i) {
-                a.ans = Some('n');
-            }
+        if let Some(i) = self.ask.take()
+            && let Some(B::Ask(a)) = self.bs.get_mut(i)
+        {
+            a.ans = Some('n');
         }
         self.sb = None;
         self.busy = false;
@@ -3242,14 +3242,13 @@ impl App {
 /// and was dropped as a shortcut. A Ctrl+Alt key that carries a printable character other than
 /// an ASCII letter or digit (those are real Ctrl+Alt shortcuts) is typed text: drop Ctrl and Alt.
 pub fn altgr(mut k: KeyEvent) -> KeyEvent {
-    if let KeyCode::Char(c) = k.code {
-        if k.modifiers.contains(Km::CONTROL | Km::ALT)
-            && !c.is_control()
-            && !c.is_whitespace()
-            && !c.is_ascii_alphanumeric()
-        {
-            k.modifiers.remove(Km::CONTROL | Km::ALT);
-        }
+    if let KeyCode::Char(c) = k.code
+        && k.modifiers.contains(Km::CONTROL | Km::ALT)
+        && !c.is_control()
+        && !c.is_whitespace()
+        && !c.is_ascii_alphanumeric()
+    {
+        k.modifiers.remove(Km::CONTROL | Km::ALT);
     }
     k
 }
@@ -4505,10 +4504,10 @@ fn lp<T: V>(term: &mut Terminal<CrosstermBackend<io::Stdout>>, v: &mut T) -> io:
         done = due;
         if std::env::var("NONAME_MOCK").is_err() {
             let sid = a.session_id();
-            if let Ok(mut s) = SID.lock() {
-                if *s != sid {
-                    *s = sid;
-                }
+            if let Ok(mut s) = SID.lock()
+                && *s != sid
+            {
+                *s = sid;
             }
         }
     }
@@ -4588,10 +4587,10 @@ fn bye() {
     let _g = o.lock();
     let _ = restore();
     sys::opacity_back();
-    if let Ok(s) = SID.lock() {
-        if !s.is_empty() {
-            let _ = writeln!(io::stdout(), "resume this session:  noname -r {s}");
-        }
+    if let Ok(s) = SID.lock()
+        && !s.is_empty()
+    {
+        let _ = writeln!(io::stdout(), "resume this session:  noname -r {s}");
     }
     live::killall();
 }

@@ -511,10 +511,10 @@ pub fn exists(p: &str) -> bool {
     let now = std::time::Instant::now();
     SEEN.with(|m| {
         let mut m = m.borrow_mut();
-        if let Some(&(e, t)) = m.get(p) {
-            if now.duration_since(t).as_secs() < 2 {
-                return e;
-            }
+        if let Some(&(e, t)) = m.get(p)
+            && now.duration_since(t).as_secs() < 2
+        {
+            return e;
         }
         if m.len() > 4096 {
             m.clear();
@@ -937,22 +937,22 @@ fn tm() -> Option<Tm> {
     T.get_or_init(|| {
         let e = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         let ok = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
-        if let Some(p) = e("PTYXIS_PROFILE").filter(|p| ok(p)) {
-            if which("gsettings").is_some() {
-                return Some(Tm::Px(p));
-            }
+        if let Some(p) = e("PTYXIS_PROFILE").filter(|p| ok(p))
+            && which("gsettings").is_some()
+        {
+            return Some(Tm::Px(p));
         }
-        if let Some(k) = e("KITTY_WINDOW_ID").filter(|k| k.chars().all(|c| c.is_ascii_digit())) {
-            if e("TMUX").is_none() || (e("KITTY_LISTEN_ON").is_some() && which("kitten").is_some())
-            {
-                return Some(Tm::Kt(k));
-            }
+        if let Some(k) = e("KITTY_WINDOW_ID").filter(|k| k.chars().all(|c| c.is_ascii_digit()))
+            && (e("TMUX").is_none()
+                || (e("KITTY_LISTEN_ON").is_some() && which("kitten").is_some()))
+        {
+            return Some(Tm::Kt(k));
         }
         if let Some(w) = e("ALACRITTY_WINDOW_ID").filter(|w| w.chars().all(|c| c.is_ascii_digit()))
+            && e("ALACRITTY_SOCKET").is_some()
+            && which("alacritty").is_some()
         {
-            if e("ALACRITTY_SOCKET").is_some() && which("alacritty").is_some() {
-                return Some(Tm::Al(w));
-            }
+            return Some(Tm::Al(w));
         }
         if e("GNOME_TERMINAL_SERVICE").is_some() && which("gsettings").is_some() {
             let id = gs(&["get", "org.gnome.Terminal.ProfilesList", "default"])?
@@ -1144,10 +1144,10 @@ pub fn opacity_restore() {
     match &t {
         Tm::Px(id) | Tm::Gt(id) => {
             let f = origf(id);
-            if let Ok(s) = std::fs::read_to_string(&f) {
-                if gput(&t, s.trim()) {
-                    let _ = std::fs::remove_file(&f);
-                }
+            if let Ok(s) = std::fs::read_to_string(&f)
+                && gput(&t, s.trim())
+            {
+                let _ = std::fs::remove_file(&f);
             }
         }
         Tm::Kt(id) if p > 0 => {

@@ -490,7 +490,7 @@ impl Bg {
                         put(b, x + 1, h as i32 - 1, ",", grad(&[base, CY()], 0.1));
                     }
                 }
-                if self.fl.is_none() && hsh(t / 30, 99) % 9 == 0 && t % 30 == 0 {
+                if self.fl.is_none() && hsh(t / 30, 99).is_multiple_of(9) && t.is_multiple_of(30) {
                     let mut v = vec![];
                     let mut x = (hsh(t, 5) % w as u64) as i32;
                     for y in 0..(h as i32 * 2 / 3) {
@@ -534,7 +534,7 @@ impl Bg {
                     for x in 0..a.width {
                         let sx = (x as u64 * 2 + t / 90) / 2;
                         let h = hsh(sx * 7919 + y as u64 * 104729, 17);
-                        if h % 61 != 0 || !free(b, x, y) {
+                        if !h.is_multiple_of(61) || !free(b, x, y) {
                             continue;
                         }
                         let tw = (pulse(t + h % 200, 80.0 + (h % 60) as f32) * 6.0).round() / 6.0;
@@ -542,7 +542,7 @@ impl Bg {
                         let c = grad(
                             &[
                                 grad(&[FA(), BASE()], 0.85),
-                                if h % 3 == 0 { CY() } else { LI() },
+                                if h.is_multiple_of(3) { CY() } else { LI() },
                             ],
                             0.15 + tw * 0.35,
                         );
@@ -645,8 +645,13 @@ impl Bg {
         for mut d in std::mem::take(&mut self.ds) {
             let ny = d.y + d.v * dt;
             let drift = ((t as f32 * 0.03 + (d.s % 100) as f32).sin() * 0.6).round() as i32;
-            let x = (d.x as i32 + if hsh(d.s, t / 20) % 9 == 0 { drift } else { 0 })
-                .clamp(0, w as i32 - 1);
+            let x = (d.x as i32
+                + if hsh(d.s, t / 20).is_multiple_of(9) {
+                    drift
+                } else {
+                    0
+                })
+            .clamp(0, w as i32 - 1);
             d.x = x as u16;
             let (y0, y1) = (d.y.floor() as i32, ny.floor() as i32);
             let mut landed = false;

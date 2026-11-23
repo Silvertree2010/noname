@@ -147,12 +147,11 @@ fn base(p: &str) -> String {
 impl App {
     pub(crate) fn ocev(&mut self, e: Value) {
         let ty = sv(&e, "type");
-        if let Some(id) = e["sessionID"].as_str() {
-            if let Some(c) = &mut self.cx {
-                if c.tid.is_none() {
-                    c.tid = Some(id.to_string());
-                }
-            }
+        if let Some(id) = e["sessionID"].as_str()
+            && let Some(c) = &mut self.cx
+            && c.tid.is_none()
+        {
+            c.tid = Some(id.to_string());
         }
         let p = &e["part"];
         match ty.as_str() {

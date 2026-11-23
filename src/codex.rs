@@ -384,10 +384,10 @@ impl App {
                     use std::io::Write;
                     let _ = writeln!(f, "{l}");
                 }
-                if let Ok(v) = serde_json::from_str::<Value>(&l) {
-                    if tx.send(v).is_err() {
-                        break;
-                    }
+                if let Ok(v) = serde_json::from_str::<Value>(&l)
+                    && tx.send(v).is_err()
+                {
+                    break;
                 }
             }
             // the last stderr lines must arrive before the end marker
@@ -416,12 +416,12 @@ impl App {
     pub(crate) fn cstop(&mut self) {
         self.ckill();
         for b in self.bs.iter_mut() {
-            if let B::Tl(t) = b {
-                if t.st == St::Run {
-                    t.st = St::Err;
-                    t.t1 = self.t;
-                    t.sum = "interrupted".into();
-                }
+            if let B::Tl(t) = b
+                && t.st == St::Run
+            {
+                t.st = St::Err;
+                t.t1 = self.t;
+                t.sum = "interrupted".into();
             }
         }
         self.busy = false;
@@ -481,10 +481,11 @@ impl App {
         match e["type"].as_str().unwrap_or("") {
             "thread.started" => {
                 let id = sv(&e, "thread_id");
-                if let Some(c) = &mut self.cx {
-                    if c.tid.is_none() && !id.is_empty() {
-                        c.tid = Some(id);
-                    }
+                if let Some(c) = &mut self.cx
+                    && c.tid.is_none()
+                    && !id.is_empty()
+                {
+                    c.tid = Some(id);
                 }
             }
             "item.started" | "item.updated" | "item.completed" => {
@@ -520,11 +521,11 @@ impl App {
                 self.busy = false;
                 self.sb = None;
                 for b in self.bs.iter_mut() {
-                    if let B::Tl(t) = b {
-                        if t.st == St::Run {
-                            t.st = St::Ok;
-                            t.t1 = self.t;
-                        }
+                    if let B::Tl(t) = b
+                        && t.st == St::Run
+                    {
+                        t.st = St::Ok;
+                        t.t1 = self.t;
                     }
                 }
                 if let Some(c) = &mut self.cx {
