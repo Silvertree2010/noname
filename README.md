@@ -111,6 +111,10 @@ Every Claude Code command and skill works as usual, except Claude Code's own `/v
 
 Don't need it? Build with `cargo build --release --no-default-features` and the voice code is left out of the program entirely.
 
+### Session files on /clear
+
+Claude Code keeps every session on disk (transcript, tool results, file history, plans). In `/noname`, **session files on /clear** decides what happens to them when `/clear` starts a new session: `off` (the default, Claude keeps them), `move` or `delete`. With `move` they go to one dated folder per session inside the **move folder** (pick that row, or type `/clear-folder <path>`), in the same layout as under `~/.claude`, so a session can be copied back. A moved or deleted session no longer shows up in `/resume`. Your memory and other sessions are never touched.
+
 ### Custom themes
 
 Drop a `<name>.theme` file into `~/.config/noname/themes/` (`%APPDATA%\noname\themes\` on Windows) and it shows up in `/theme`. Missing keys fall back to the default theme, and a file named like a built-in theme replaces it.

@@ -972,6 +972,10 @@ impl App {
             ("mcp", "mcp servers: reconnect, enable or disable"),
             ("diff", "all changes in this workspace"),
             ("rename", "name this session"),
+            (
+                "clear-folder",
+                "folder that /clear moves session files to (see /noname)",
+            ),
         ] {
             if self.lv.is_some() || matches!(c, "model" | "effort" | "tasks") {
                 v.retain(|x| x.0 != c);
@@ -1048,14 +1052,24 @@ impl App {
             "clear" | "new" => {
                 let args: Vec<String> =
                     self.lv.as_ref().map(|l| fresh(&l.args)).unwrap_or_default();
+                let old = self.session_id();
                 if let Ok(mut n) = App::live(args) {
                     n.tc = self.t;
                     n.t = self.t;
                     n.hist = std::mem::take(&mut self.hist);
                     n.pst = std::mem::take(&mut self.pst);
+                    // the old claude is stopped when the old state is dropped here, so its files are
+                    // no longer written when the move or delete starts
                     *self = n;
+                    if !old.is_empty() {
+                        self.swr = crate::sweep::start(&old);
+                    }
                 }
             }
+            "clear-folder" => match crate::sweep::set_folder(arg) {
+                Ok(f) => self.toast(format!("move folder  {f}")),
+                Err(e) => self.toast(format!("move folder  {e}")),
+            },
             "model" if arg.is_empty() => self.modelpicker(),
             "model" if self.pickmodel(arg.trim()).is_some() => {
                 // switch right here, so the name on screen changes at once instead of at the next turn

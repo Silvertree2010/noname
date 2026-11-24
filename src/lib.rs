@@ -11,6 +11,7 @@ pub mod free;
 pub mod img;
 mod live;
 mod opencode;
+pub mod sweep;
 pub mod sys;
 pub mod upd;
 #[cfg(feature = "voice")]
@@ -651,6 +652,8 @@ pub struct App {
     frat: Option<Instant>,
     /// The same three for the Claude token total.
     pub clr: Option<std::sync::mpsc::Receiver<Option<u64>>>,
+    /// Move or delete of the session files `/clear` left behind, running in the background.
+    pub swr: Option<std::sync::mpsc::Receiver<String>>,
     /// Last Claude token total.
     pub clv: Option<u64>,
     clat: Option<Instant>,
@@ -999,6 +1002,7 @@ impl App {
             frv: None,
             frat: None,
             clr: None,
+            swr: None,
             clv: None,
             clat: None,
             le: 0,
@@ -1098,6 +1102,12 @@ impl App {
         }
         self.frpoll();
         self.clpoll();
+        if let Some(r) = &self.swr
+            && let Ok(m) = r.try_recv()
+        {
+            self.swr = None;
+            self.toast(m);
+        }
         #[cfg(feature = "voice")]
         self.vpoll();
         if let Some(r) = &self.upr
@@ -1608,6 +1618,15 @@ impl App {
                 }
                 .into(),
             ),
+            (
+                "session files on /clear",
+                match sweep::mode() {
+                    sweep::Mode::Off => "off, kept by claude".into(),
+                    sweep::Mode::Move => "move to the folder below".into(),
+                    sweep::Mode::Delete => "delete".into(),
+                },
+            ),
+            ("move folder", sweep::folder()),
             (
                 "check for updates",
                 if self.ups.is_empty() {
@@ -2928,6 +2947,15 @@ impl App {
                             "free token count  {}",
                             if on { "on" } else { "off" }
                         ));
+                    }
+                    18 => {
+                        let m = sweep::mode().next();
+                        sweep::set_mode(m);
+                        self.toast(format!("session files on /clear  {}", m.name()));
+                    }
+                    19 => {
+                        self.ns = None;
+                        self.setinp(format!("/clear-folder {}", sweep::folder()));
                     }
                     17 => {
                         let on = !free::claude_enabled();
