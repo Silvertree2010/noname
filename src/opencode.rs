@@ -104,11 +104,11 @@ pub(crate) fn build(
     let mut cmd = Command::new(crate::sys::bin("opencode"));
     cmd.args(["run", "--format", "json", "--thinking"]);
     match mode {
-        1 => {
+        2 => {
             cmd.args(["--agent", "plan"]);
         }
         // opencode run cannot ask: without --auto every permission request is rejected
-        2 | 3 => {
+        1 | 3 | 4 => {
             cmd.arg("--auto");
         }
         _ => {}

@@ -212,7 +212,16 @@ impl Drop for Lv {
     }
 }
 
-const PM: [&str; 4] = ["default", "plan", "auto", "bypassPermissions"];
+/// Set once the session has been in bypass mode, which keeps bypass in the Shift+Tab cycle.
+static BYP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+const PM: [&str; 5] = [
+    "default",
+    "acceptEdits",
+    "plan",
+    "auto",
+    "bypassPermissions",
+];
 
 fn rd(r: impl io::Read + Send + 'static) -> Receiver<Value> {
     let (tx, rx) = channel();
@@ -1086,6 +1095,15 @@ impl App {
                     ..Default::default()
                 });
             }
+            "usage" | "stats" if arg.is_empty() => {
+                self.ctrl("usg", json!({"subtype": "get_usage"}));
+                self.pk = Some(Pk {
+                    kind: 5,
+                    title: "usage".into(),
+                    lines: vec![('m', "loading…".into())],
+                    ..Default::default()
+                });
+            }
             "diff" if arg.is_empty() => {
                 self.ctrl("dif", json!({"subtype": "get_workspace_diff"}));
                 self.pk = Some(Pk {
@@ -1336,8 +1354,28 @@ impl App {
         }
     }
 
+    /// Whether this session was started in bypass mode, which is what lets Shift+Tab reach it.
+    pub(crate) fn bypok(&self) -> bool {
+        // lmode rewrites the args, so the first sight of bypass is remembered
+        BYP.load(std::sync::atomic::Ordering::Relaxed)
+            || crate::defmode() == Some(4)
+            || self.lv.as_ref().is_some_and(|l| {
+                l.args.iter().any(|x| {
+                    x == "--dangerously-skip-permissions"
+                        || x == "--allow-dangerously-skip-permissions"
+                        || x == "--permission-mode=bypassPermissions"
+                }) || l
+                    .args
+                    .windows(2)
+                    .any(|w| w[0] == "--permission-mode" && w[1] == "bypassPermissions")
+            })
+    }
+
     pub(crate) fn lmode(&mut self) {
         let m = PM[self.mode];
+        if self.bypok() {
+            BYP.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(l) = &mut self.lv {
             l.args = with_mode(&l.args, m);
         }
@@ -1414,9 +1452,10 @@ impl App {
         if q.plan {
             let a = q.ans.first().map(|x| x.1.clone()).unwrap_or_default();
             let m = match a.as_str() {
-                "yes, auto mode" => Some(2),
+                "yes, auto mode" => Some(3),
+                "yes, accept edits" => Some(1),
                 "yes, approve edits" => Some(0),
-                "yes, bypass permissions" => Some(3),
+                "yes, bypass permissions" => Some(4),
                 _ => None,
             };
             let r = match m {
@@ -1533,6 +1572,10 @@ impl App {
                     "Claude works on its own, the classifier checks risky steps".to_string(),
                 ),
                 (
+                    "yes, accept edits".to_string(),
+                    "edits go through, commands still ask".to_string(),
+                ),
+                (
                     "yes, approve edits".to_string(),
                     "you approve each edit and command".to_string(),
                 ),
@@ -1554,7 +1597,7 @@ impl App {
                 }],
                 i: 0,
                 sel: 0,
-                pick: vec![false; 4],
+                pick: vec![false; 5],
                 ans: vec![],
                 plan: true,
             });
@@ -1682,8 +1725,9 @@ impl App {
         }
         let model = sv(&p["arguments"], "model");
         let mode = match self.mode {
-            2 => "auto",
-            3 => "bypassPermissions",
+            1 => "acceptEdits",
+            3 => "auto",
+            4 => "bypassPermissions",
             _ => "default",
         };
         let cwd = std::env::current_dir()
@@ -2378,6 +2422,29 @@ impl App {
                     let m = p["maxTokens"].as_f64().unwrap_or(0.0);
                     if m > 0.0 {
                         self.ctx = (t / m * 100.0) as f32;
+                    }
+                } else if id.starts_with("usg") {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    let l = if r["subtype"] == "error" {
+                        vec![('r', one(&sv(r, "error"), 80))]
+                    } else {
+                        crate::usage::lines(p, now)
+                    };
+                    if let Some(k) = &mut self.pk
+                        && k.kind == 5
+                    {
+                        k.lines = l;
+                        k.off = 0;
+                    }
+                    let rl = &p["rate_limits"];
+                    if let Some(u) = rl["five_hour"]["utilization"].as_f64() {
+                        self.h5 = u as f32;
+                    }
+                    if let Some(u) = rl["seven_day"]["utilization"].as_f64() {
+                        self.d7 = u as f32;
                     }
                 } else if id.starts_with("use") {
                     let rl = &p["rate_limits"];

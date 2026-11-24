@@ -127,10 +127,10 @@ pub(crate) fn build(
     }
     cmd.args(["--json", "--skip-git-repo-check"]);
     match mode {
-        1 => {
+        2 => {
             cmd.args(["-s", "read-only"]);
         }
-        3 => {
+        4 => {
             cmd.arg("--dangerously-bypass-approvals-and-sandbox");
         }
         _ => {
