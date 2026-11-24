@@ -1145,10 +1145,10 @@ impl V for V1 {
 
     fn scen(&mut self, s: &str, a: &mut App) {
         match s {
-            "plan" => a.mode = 1,
-            "byp" => a.mode = 3,
+            "plan" => a.mode = 2,
+            "byp" => a.mode = 4,
             "morph" => {
-                a.mode = 2;
+                a.mode = 3;
                 a.t = 5;
                 a.tm = 1;
             }
@@ -1544,7 +1544,26 @@ impl V for V1 {
             extra.push(Line::default());
         }
         if let Some(p) = &a.pk {
-            if p.kind == 4 {
+            if p.kind == 5 {
+                extra.push(Line::from(Span::styled("usage", st(L2()).bold())));
+                for (c, l) in p.lines.iter().skip(p.off).take(30) {
+                    let s = match c {
+                        'h' => st(L2()).bold(),
+                        'w' => st(WH()),
+                        'g' => st(GR()),
+                        'y' => st(PK()),
+                        'r' => st(RD()),
+                        'f' => st(FA()),
+                        _ => st(MU()),
+                    };
+                    let mut l = l.clone();
+                    if l.chars().count() > w.saturating_sub(4) {
+                        l = l.chars().take(w.saturating_sub(5)).collect::<String>() + "~";
+                    }
+                    extra.push(Line::from(vec![pad(2), Span::styled(l, s)]));
+                }
+                extra.push(Line::from(Span::styled("  esc close", st(FA()))));
+            } else if p.kind == 4 {
                 let sel = p.items.get(p.sel).map(|x| x.2.clone()).unwrap_or_default();
                 extra.push(lr(
                     vec![
@@ -2104,12 +2123,15 @@ impl V for V1 {
         let pc = if a.ask.is_some() || a.qa.is_some() {
             PK()
         } else {
-            [LI(), CY(), GR(), RD()][a.mode]
+            [LI(), PK(), CY(), GR(), RD()][a.mode]
         };
         let pg: Vec<Span<'static>> = if a.tm > 0 && a.t.saturating_sub(a.tm) < 9 {
             noise(1, a.t, 61, &gd())
         } else {
-            vec![Span::styled(["›", "?", "»", "!"][a.mode], st(pc).bold())]
+            vec![Span::styled(
+                ["›", "+", "?", "»", "!"][a.mode],
+                st(pc).bold(),
+            )]
         };
         let gh = ghost(a);
         let mut il2: Vec<Line> = vec![];

@@ -14,6 +14,7 @@ mod opencode;
 pub mod sweep;
 pub mod sys;
 pub mod upd;
+mod usage;
 #[cfg(feature = "voice")]
 mod voice;
 
@@ -345,8 +346,9 @@ pub const MID_ALL: [(&str, &str); 13] = [
     ("claude-sonnet-4-6", "Sonnet 4.6"),
     ("claude-haiku-4-5", "Haiku 4.5"),
 ];
-/// Permission modes in the order Shift+Tab cycles them: default, plan, auto, bypass.
-pub const MODES: [&str; 4] = ["default", "plan", "auto", "bypass"];
+/// Permission modes in the order Shift+Tab cycles them, as in Claude Code: manual (`default`), accept edits, plan, auto.
+/// Bypass comes last and only joins the cycle when the session started in it.
+pub const MODES: [&str; 5] = ["default", "accept edits", "plan", "auto", "bypass"];
 /// Slash commands of the mock engine as (name, description), for the command menu.
 pub const CMDS: [(&str, &str); 9] = [
     ("btw", "side question, main chat keeps going"),
@@ -730,7 +732,7 @@ pub struct App {
 /// State of a list picker.
 #[derive(Clone, Default)]
 pub struct Pk {
-    /// Picker kind: 0 model, 1 effort, 2 MCP servers, 3 diff file list, 4 diff text of one file.
+    /// Picker kind: 0 model, 1 effort, 2 MCP servers, 3 diff file list, 4 diff text of one file, 5 usage panel.
     pub kind: u8,
     /// Title of the picker.
     pub title: String,
@@ -1652,6 +1654,12 @@ impl App {
         ));
     }
 
+    /// The mode Shift+Tab goes to next. Bypass only takes part when the session runs in it, as in Claude Code.
+    pub fn nextmode(&self) -> usize {
+        let n = if self.mode == 4 || self.bypok() { 5 } else { 4 };
+        (self.mode + 1) % n
+    }
+
     /// Sets the default permission mode to index `i` of `MODES`, saves it and applies it to the session.
     pub fn setdefmode(&mut self, i: usize) {
         if self.lv.is_some() || self.cx.is_some() {
@@ -2131,9 +2139,10 @@ impl App {
     fn pkkey(&mut self, k: KeyEvent) {
         let Some(p) = &mut self.pk else { return };
         let n = p.items.len();
-        if p.kind == 4 {
+        if p.kind == 4 || p.kind == 5 {
             let h = p.lines.len();
             match k.code {
+                KeyCode::Esc | KeyCode::Left if p.kind == 5 => self.pk = None,
                 KeyCode::Esc | KeyCode::Left => {
                     p.kind = 3;
                     p.lines.clear();
@@ -3167,7 +3176,7 @@ impl App {
                 self.cur = j
             }
             KeyCode::BackTab => {
-                self.mode = (self.mode + 1) % MODES.len();
+                self.mode = self.nextmode();
                 self.tm = self.t.max(1);
                 self.lmode();
                 self.toast(format!("mode  {}", MODES[self.mode]))
@@ -4877,10 +4886,11 @@ pub fn modefile() -> String {
 /// Index in `MODES` for a mode name or alias, or `None` if it is not one.
 pub fn modeidx(s: &str) -> Option<usize> {
     match s.trim().to_lowercase().as_str() {
-        "default" | "ask" | "normal" => Some(0),
-        "plan" => Some(1),
-        "auto" | "acceptedits" | "accept-edits" => Some(2),
-        "bypass" | "bypasspermissions" | "yolo" => Some(3),
+        "default" | "ask" | "normal" | "manual" => Some(0),
+        "accept edits" | "acceptedits" | "accept-edits" | "edits" => Some(1),
+        "plan" => Some(2),
+        "auto" => Some(3),
+        "bypass" | "bypasspermissions" | "yolo" => Some(4),
         _ => None,
     }
 }

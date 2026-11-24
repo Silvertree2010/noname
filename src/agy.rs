@@ -38,14 +38,14 @@ pub(crate) fn build(
     let mut cmd = Command::new(crate::sys::bin("agy"));
     cmd.args(["--output-format", "stream-json"]);
     match mode {
-        1 => {
+        2 => {
             cmd.args(["--mode", "plan"]);
         }
         // `--mode auto` needs the terminal sandbox and is not offered to business accounts: accept-edits works everywhere
-        2 => {
+        1 | 3 => {
             cmd.args(["--mode", "accept-edits"]);
         }
-        3 => {
+        4 => {
             cmd.arg("--dangerously-skip-permissions");
         }
         _ => {}
@@ -454,16 +454,21 @@ mod tests {
     fn modes_map_to_agy_flags() {
         let a = app();
         assert!(
-            args(cx(&a), 1, "x")
+            args(cx(&a), 2, "x")
                 .windows(2)
                 .any(|w| w == ["--mode", "plan"])
         );
         assert!(
-            args(cx(&a), 2, "x")
+            args(cx(&a), 3, "x")
                 .windows(2)
                 .any(|w| w == ["--mode", "accept-edits"])
         );
-        assert!(args(cx(&a), 3, "x").contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(
+            args(cx(&a), 1, "x")
+                .windows(2)
+                .any(|w| w == ["--mode", "accept-edits"])
+        );
+        assert!(args(cx(&a), 4, "x").contains(&"--dangerously-skip-permissions".to_string()));
         let d = args(cx(&a), 0, "x");
         assert!(
             !d.contains(&"--mode".to_string())

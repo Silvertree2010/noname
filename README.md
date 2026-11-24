@@ -66,6 +66,7 @@ Standard setup for Google's Antigravity CLI (`agy`):
 | noname mode | `agy` flag |
 |---|---|
 | default | none: shell commands are asked |
+| accept edits | `--mode accept-edits` |
 | plan | `--mode plan` |
 | auto | `--mode accept-edits` |
 | bypass | `--dangerously-skip-permissions` |
@@ -88,7 +89,7 @@ Other flags go straight to `claude`.
 | `shift+enter` | new line | `/theme` | color theme |
 | `esc` | stop | `/background` | animated background |
 | `esc esc` | rewind | `/default-permission` | starting mode |
-| `shift+tab` | cycle mode | `/resume` | older sessions |
+| `shift+tab` | cycle mode (manual, accept edits, plan, auto) | `/resume` | older sessions |
 | `ctrl+o` | details | `/btw` | side question |
 | `→` | accept suggestion | `/model` | cycle models |
 | `ctrl+v` | paste image | | |
