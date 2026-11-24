@@ -1545,8 +1545,20 @@ impl V for V1 {
         }
         if let Some(p) = &a.pk {
             if p.kind == 5 {
-                extra.push(Line::from(Span::styled("usage", st(L2()).bold())));
-                for (c, l) in p.lines.iter().skip(p.off).take(30) {
+                let mut bar = vec![Span::styled("Settings  ", st(L2()).bold())];
+                for (i, t) in noname::usage_tabs().iter().enumerate() {
+                    bar.push(if i == p.tab {
+                        Span::styled(format!(" {t} "), st(WH()).bold().reversed())
+                    } else {
+                        Span::styled(format!(" {t} "), st(MU()))
+                    });
+                    bar.push(Span::raw(" "));
+                }
+                extra.push(Line::from(bar));
+                extra.push(Line::default());
+                let page: &[(char, String)] = p.pages.get(p.tab).map_or(&[], |x| x.as_slice());
+                let hh = (ar.height as usize * 2 / 3).clamp(6, 30);
+                for (c, l) in page.iter().skip(p.off).take(hh) {
                     let s = match c {
                         'h' => st(L2()).bold(),
                         'w' => st(WH()),
@@ -1562,7 +1574,15 @@ impl V for V1 {
                     }
                     extra.push(Line::from(vec![pad(2), Span::styled(l, s)]));
                 }
-                extra.push(Line::from(Span::styled("  esc close", st(FA()))));
+                let more = if page.len() > p.off + hh {
+                    format!("  ·  ↓ {} more", page.len() - p.off - hh)
+                } else {
+                    String::new()
+                };
+                extra.push(Line::from(Span::styled(
+                    format!("  ←/→ tab  ·  ↑↓ scroll  ·  esc close{more}"),
+                    st(FA()),
+                )));
             } else if p.kind == 4 {
                 let sel = p.items.get(p.sel).map(|x| x.2.clone()).unwrap_or_default();
                 extra.push(lr(

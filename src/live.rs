@@ -348,7 +348,7 @@ fn fresh(args: &[String]) -> Vec<String> {
     o
 }
 
-fn mnm(id: &str) -> String {
+pub(crate) fn mnm(id: &str) -> String {
     let s = id.trim_start_matches("claude-");
     let s = s.split('[').next().unwrap_or(s);
     let ps: Vec<&str> = s.split('-').filter(|x| x.len() < 8).collect();
@@ -1021,6 +1021,48 @@ impl App {
         }
     }
 
+    /// Fills the Status, Config and Stats tabs of the open settings panel from what Claude answered so far.
+    fn spages(&mut self) {
+        if self.pk.as_ref().is_none_or(|k| k.kind != 5) {
+            return;
+        }
+        let sid = self.lv.as_ref().map(|l| l.sid.clone()).unwrap_or_default();
+        let model = if self.mname.is_empty() || self.mname == "…" {
+            String::new()
+        } else {
+            self.mname.clone()
+        };
+        let mode = MODES.get(self.mode).copied().unwrap_or("");
+        let here = crate::usage::Here {
+            sid: &sid,
+            cwd: &self.cwd,
+            model: &model,
+            effort: &self.effs,
+            mode,
+        };
+        let status = crate::usage::status_lines(&self.cinfo, &self.cset, &self.cmcp, &here);
+        let config = crate::usage::config_lines(&self.cset);
+        let home = crate::sys::home();
+        let dir = std::env::var("CLAUDE_CONFIG_DIR")
+            .ok()
+            .filter(|x| !x.is_empty())
+            .unwrap_or_else(|| format!("{home}/.claude"));
+        let st: Value = std::fs::read_to_string(format!("{dir}/stats-cache.json"))
+            .ok()
+            .and_then(|x| serde_json::from_str(&x).ok())
+            .unwrap_or(Value::Null);
+        let today = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64 / 86_400)
+            .unwrap_or(0);
+        let stats = crate::usage::stats_lines(&st, today, mnm);
+        if let Some(k) = &mut self.pk {
+            k.pages[0] = status;
+            k.pages[1] = config;
+            k.pages[3] = stats;
+        }
+    }
+
     fn ctrl(&mut self, tag: &str, req: Value) {
         let Some(l) = &mut self.lv else { return };
         l.rid += 1;
@@ -1095,14 +1137,21 @@ impl App {
                     ..Default::default()
                 });
             }
-            "usage" | "stats" if arg.is_empty() => {
+            "usage" | "stats" | "status" | "config" | "settings" if arg.is_empty() => {
                 self.ctrl("usg", json!({"subtype": "get_usage"}));
+                self.ctrl("get", json!({"subtype": "get_settings"}));
+                self.ctrl("smc", json!({"subtype": "mcp_status"}));
+                let tab = crate::usage::tab_of(c);
+                let mut pages = vec![vec![]; crate::usage::TABS.len()];
+                pages[2] = vec![('m', "loading…".into())];
                 self.pk = Some(Pk {
                     kind: 5,
-                    title: "usage".into(),
-                    lines: vec![('m', "loading…".into())],
+                    title: "settings".into(),
+                    tab,
+                    pages,
                     ..Default::default()
                 });
+                self.spages();
             }
             "diff" if arg.is_empty() => {
                 self.ctrl("dif", json!({"subtype": "get_workspace_diff"}));
@@ -2215,6 +2264,7 @@ impl App {
                 let id = sv(r, "request_id");
                 let p = &r["response"];
                 if id.starts_with("init") {
+                    self.cinfo = p.clone();
                     if let (Some(l), Some(cs)) = (&mut self.lv, p["commands"].as_array()) {
                         l.cmds = cs
                             .iter()
@@ -2278,7 +2328,13 @@ impl App {
                     self.syncset();
                 } else if id.starts_with("mdl-") || id.starts_with("eff-") {
                     self.syncset();
+                } else if id.starts_with("smc-") {
+                    self.cmcp = p.clone();
+                    self.spages();
                 } else if id.starts_with("get-") {
+                    if p.is_object() {
+                        self.cset = p.clone();
+                    }
                     let ap = &p["applied"];
                     let ef = sv(ap, "effort");
                     if !ef.is_empty() {
@@ -2291,6 +2347,7 @@ impl App {
                         }
                         self.mname = mnm(&m);
                     }
+                    self.spages();
                 } else if id.starts_with("rwf") {
                     let n = p["filesChanged"]
                         .as_array()
@@ -2436,8 +2493,7 @@ impl App {
                     if let Some(k) = &mut self.pk
                         && k.kind == 5
                     {
-                        k.lines = l;
-                        k.off = 0;
+                        k.pages[2] = l;
                     }
                     let rl = &p["rate_limits"];
                     if let Some(u) = rl["five_hour"]["utilization"].as_f64() {

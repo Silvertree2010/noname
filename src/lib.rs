@@ -350,7 +350,7 @@ pub const MID_ALL: [(&str, &str); 13] = [
 /// Bypass comes last and only joins the cycle when the session started in it.
 pub const MODES: [&str; 5] = ["default", "accept edits", "plan", "auto", "bypass"];
 /// Slash commands of the mock engine as (name, description), for the command menu.
-pub const CMDS: [(&str, &str); 9] = [
+pub const CMDS: [(&str, &str); 12] = [
     ("btw", "side question, main chat keeps going"),
     ("clear", "new session, empty context"),
     ("compact", "summarize to free context"),
@@ -358,9 +358,17 @@ pub const CMDS: [(&str, &str); 9] = [
     ("effort", "switch effort level"),
     ("context", "show context usage"),
     ("resume", "pick an older session"),
-    ("usage", "plan limits and stats"),
+    ("status", "version, account, model and MCP servers"),
+    ("config", "settings in effect"),
+    ("usage", "plan limits"),
+    ("stats", "your Claude Code usage over time"),
     ("help", "keys and commands"),
 ];
+
+/// The tab names of the settings panel (`/status`, `/config`, `/usage`, `/stats`).
+pub fn usage_tabs() -> &'static [&'static str] {
+    &usage::TABS
+}
 
 /// Kind of a tool call, which decides its symbol and colour.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -711,6 +719,12 @@ pub struct App {
     pub links: std::cell::RefCell<Vec<(u16, u16, u16, String)>>,
     /// Workspace diff as JSON from the engine, for the diff picker.
     pub diff: Option<serde_json::Value>,
+    /// Claude's answer to `initialize` (version, account, output style), for the Status tab.
+    pub cinfo: serde_json::Value,
+    /// Claude's last `get_settings` answer, for the Status and Config tabs.
+    pub cset: serde_json::Value,
+    /// Claude's last `mcp_status` answer, for the Status tab.
+    pub cmcp: serde_json::Value,
     /// Mouse selection on the screen as (start column, start row, end column, end row).
     pub msel: Option<(u16, u16, u16, u16)>,
     /// Whether a mouse drag selection is in progress.
@@ -732,7 +746,7 @@ pub struct App {
 /// State of a list picker.
 #[derive(Clone, Default)]
 pub struct Pk {
-    /// Picker kind: 0 model, 1 effort, 2 MCP servers, 3 diff file list, 4 diff text of one file, 5 usage panel.
+    /// Picker kind: 0 model, 1 effort, 2 MCP servers, 3 diff file list, 4 diff text of one file, 5 settings panel (Status, Config, Usage, Stats tabs).
     pub kind: u8,
     /// Title of the picker.
     pub title: String,
@@ -744,6 +758,10 @@ pub struct Pk {
     pub off: usize,
     /// Diff text lines as (marker character, text).
     pub lines: Vec<(char, String)>,
+    /// Settings panel (kind 5): the open tab, an index into `usage::TABS`.
+    pub tab: usize,
+    /// Settings panel (kind 5): the lines of each tab as (colour code, text).
+    pub pages: Vec<Vec<(char, String)>>,
 }
 
 /// A background task: shell, monitor, agent or workflow.
@@ -1048,6 +1066,9 @@ impl App {
                 .collect(),
             links: std::cell::RefCell::new(vec![]),
             diff: None,
+            cinfo: serde_json::Value::Null,
+            cset: serde_json::Value::Null,
+            cmcp: serde_json::Value::Null,
             msel: None,
             seld: false,
             txt: std::cell::RefCell::new(None),
@@ -2139,10 +2160,32 @@ impl App {
     fn pkkey(&mut self, k: KeyEvent) {
         let Some(p) = &mut self.pk else { return };
         let n = p.items.len();
-        if p.kind == 4 || p.kind == 5 {
+        if p.kind == 5 {
+            let h = p.pages.get(p.tab).map_or(0, |x| x.len());
+            let n = usage::TABS.len();
+            match k.code {
+                KeyCode::Esc => self.pk = None,
+                KeyCode::Right | KeyCode::Tab => {
+                    p.tab = (p.tab + 1) % n;
+                    p.off = 0;
+                }
+                KeyCode::Left | KeyCode::BackTab => {
+                    p.tab = (p.tab + n - 1) % n;
+                    p.off = 0;
+                }
+                KeyCode::Up => p.off = p.off.saturating_sub(1),
+                KeyCode::Down => p.off = (p.off + 1).min(h.saturating_sub(1)),
+                KeyCode::PageUp => p.off = p.off.saturating_sub(10),
+                KeyCode::PageDown | KeyCode::Char(' ') => {
+                    p.off = (p.off + 10).min(h.saturating_sub(1))
+                }
+                _ => {}
+            }
+            return;
+        }
+        if p.kind == 4 {
             let h = p.lines.len();
             match k.code {
-                KeyCode::Esc | KeyCode::Left if p.kind == 5 => self.pk = None,
                 KeyCode::Esc | KeyCode::Left => {
                     p.kind = 3;
                     p.lines.clear();
