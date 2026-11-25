@@ -11,6 +11,7 @@ pub mod free;
 pub mod img;
 mod live;
 mod opencode;
+mod phone;
 mod proj;
 pub mod sweep;
 pub mod sys;
@@ -671,6 +672,8 @@ pub struct App {
     frat: Option<Instant>,
     /// The same three for the Claude token total.
     pub clr: Option<std::sync::mpsc::Receiver<Option<u64>>>,
+    /// `/phone`: this window receives text spoken on the phone.
+    ph: Option<phone::Ph>,
     /// Move or delete of the session files `/clear` left behind, running in the background.
     pub swr: Option<std::sync::mpsc::Receiver<String>>,
     /// Last Claude token total.
@@ -1033,6 +1036,7 @@ impl App {
             frv: None,
             frat: None,
             clr: None,
+            ph: None,
             swr: None,
             clv: None,
             clat: None,
@@ -1190,6 +1194,7 @@ impl App {
             self.swr = None;
             self.toast(m);
         }
+        self.phpoll();
         #[cfg(feature = "voice")]
         self.vpoll();
         if let Some(r) = &self.upr
@@ -1882,6 +1887,10 @@ impl App {
         #[cfg(feature = "voice")]
         if c0 == "voice" {
             self.voice(a0.trim());
+            return;
+        }
+        if c0 == "phone" {
+            self.phone(a0.trim());
             return;
         }
         if c0 == "copy" {
@@ -5131,6 +5140,53 @@ fn editor(s: &str) -> Option<String> {
 const CC_WIN: u64 = 60;
 
 const QGRACE: u64 = 15;
+
+impl App {
+    /// `/phone` makes this window the receiver for phone dictation; `/phone` again or `/phone off` stops it.
+    fn phone(&mut self, a: &str) {
+        if a == "off" || (a.is_empty() && self.ph.is_some()) {
+            if self.ph.take().is_some() {
+                phone::disarm();
+            }
+            self.toast("phone  off");
+            return;
+        }
+        match phone::arm() {
+            Ok(p) => {
+                self.ph = Some(p);
+                self.toast(
+                    "phone  on: what you say on the phone lands here  ·  /phone off to stop",
+                );
+            }
+            Err(e) => self.toast(format!("phone  {e}")),
+        }
+    }
+
+    /// Puts waiting phone text at the cursor, the same way `/voice` does.
+    fn phpoll(&mut self) {
+        let Some(p) = self.ph.as_mut() else { return };
+        match p.poll() {
+            phone::Got::None => {}
+            phone::Got::Lost => {
+                self.ph = None;
+                self.toast("phone  another window took over");
+            }
+            phone::Got::Text(t) => {
+                self.snap((self.inp.clone(), self.cur));
+                if self.cur > 0
+                    && !self
+                        .inp
+                        .chars()
+                        .nth(self.cur - 1)
+                        .is_some_and(char::is_whitespace)
+                {
+                    self.ins(' ');
+                }
+                self.put(&t);
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod ctrlc_tests {
