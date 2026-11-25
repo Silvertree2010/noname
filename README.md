@@ -112,6 +112,12 @@ Every Claude Code command and skill works as usual, except Claude Code's own `/v
 
 Don't need it? Build with `cargo build --release --no-default-features` and the voice code is left out of the program entirely.
 
+### Phone
+
+`/phone` turns this window into the receiver for text you dictate on another device: the next piece of text lands in the input box (you still press `enter`), `/phone off` stops. Only one window receives at a time; `/phone` in another window takes over.
+
+noname only does the receiving. Anything that writes plain text files into `~/.cache/slashphone/text/` (`$XDG_CACHE_HOME/slashphone/text/`) can feed it: noname takes the oldest `.txt` file, puts its text in the input and moves the file to `done/`. Write a file under another name (for example `.part`) and rename it to `.txt` when it is complete. On Linux, `/phone` also tries `systemctl --user start slashphone.service`, so a speech-to-text service of that name can be started on demand; if there is none, nothing happens. Nothing is sent over the network by noname.
+
 ### Session files on /clear
 
 Claude Code keeps every session on disk (transcript, tool results, file history, plans). In `/noname`, **session files on /clear** decides what happens to them when `/clear` starts a new session: `off` (the default, Claude keeps them), `move` or `delete`. With `move` they go to one dated folder per session inside the **move folder** (pick that row, or type `/clear-folder <path>`), in the same layout as under `~/.claude`, so a session can be copied back. A moved or deleted session no longer shows up in `/resume`. Your memory and other sessions are never touched.

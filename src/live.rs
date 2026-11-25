@@ -954,6 +954,11 @@ impl App {
                 "dictate: whisper or parakeet, runs on this machine".into(),
             ));
         }
+        v.retain(|x| x.0 != "phone");
+        v.push((
+            "phone".into(),
+            "talk on the phone, the text lands in this input (off to stop)".into(),
+        ));
         v.push(("noname".into(), "noname settings".into()));
         v.push((
             "default-permission".into(),
