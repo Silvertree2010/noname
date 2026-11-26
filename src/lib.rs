@@ -61,7 +61,7 @@ pub mod pal {
         c: [u32; 12],
     }
 
-    const BUILTIN: [Theme; 4] = [
+    const BUILTIN: [Theme; 5] = [
         Theme {
             name: "default",
             desc: "white, gray, light purple",
@@ -92,6 +92,14 @@ pub mod pal {
             c: [
                 0xcdd6f4, 0xeef1fc, 0xbac2de, 0x9399b2, 0xcba6f7, 0xb4befe, 0xf5c2e7, 0x89dceb,
                 0xa6e3a1, 0xf38ba8, 0xf5c2e7, 0x1e1e2e,
+            ],
+        },
+        Theme {
+            name: "sunflower",
+            desc: "bright yellow with warm orange, sunny",
+            c: [
+                0xece8dc, 0xffffff, 0xbdb59e, 0x857d68, 0xffd23f, 0xff9f43, 0xf2e2a8, 0x9fd8c8,
+                0xb8e06a, 0xff5f56, 0xffb38a, 0x16140d,
             ],
         },
     ];

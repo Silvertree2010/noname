@@ -27,7 +27,7 @@ noname is a terminal UI (TUI) for [Claude Code](https://claude.com/claude-code),
 - streaming text, thinking and tools, diffs that write themselves in
 - inline permissions and questions, rewind with `esc esc`, `/btw` side questions
 - live context and limit bars, cost under every answer
-- themes (default, dracula, tokyo-night, catppuccin mocha, or your own), animated backgrounds, self updates
+- themes (default, dracula, tokyo-night, catppuccin mocha, sunflower, or your own), animated backgrounds, self updates
 - image paste, `@` file mentions, background shells and subagents, `/diff`, `/mcp`, `/resume`
 - Linux, macOS and Windows; optional Codex engine with `--codex`, opencode engine with `--opencode` and Antigravity engine with `--agy`
 
