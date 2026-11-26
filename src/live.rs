@@ -34,6 +34,8 @@ pub(crate) struct Lv {
     w0: f32,
     pub cmds: Vec<(String, String)>,
     cms: Vec<Cmr>,
+    #[cfg(unix)]
+    cs: Option<crate::cm::Sess>,
 }
 
 struct Cmr {
@@ -50,6 +52,37 @@ fn init() -> Value {
         v["sdkMcpServerConfigs"] = json!({crate::cm::SRV: {"timeout": 7_200_000}});
     }
     v
+}
+
+static CMODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+
+/// Whether new messages go to a Claude Code session with Code Mode on.
+pub(crate) fn codemode() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut m = CMODE.load(Relaxed);
+    if m == u8::MAX {
+        m = defcode() as u8;
+        CMODE.store(m, Relaxed);
+    }
+    cfg!(unix) && m == 1
+}
+
+/// Turns Code Mode on or off for this run.
+pub(crate) fn setcodemode(on: bool) {
+    CMODE.store(on as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether Code Mode is on when noname starts.
+pub(crate) fn defcode() -> bool {
+    std::fs::read_to_string(crate::sys::cfgfile("codemode")).is_ok_and(|x| x.trim() == "on")
+}
+
+/// Saves whether Code Mode is on when noname starts.
+pub(crate) fn setdefcode(on: bool) {
+    crate::wcfg(
+        &crate::sys::cfgfile("codemode"),
+        if on { "on" } else { "off" },
+    );
 }
 
 static KIDS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
@@ -260,6 +293,20 @@ fn spawn(args: &[String]) -> io::Result<(Child, ChildStdin, Receiver<Value>)> {
             "--include-hook-events",
         ])
         .args(args)
+        .args(
+            if resumes(args)
+                && !args
+                    .iter()
+                    .any(|x| x == "--settings" || x.starts_with("--settings="))
+            {
+                vec![
+                    "--settings".to_string(),
+                    json!({"env": {"CLAUDE_CODE_EXPERIMENTAL_CODE_MODE": "1"}}).to_string(),
+                ]
+            } else {
+                vec![]
+            },
+        )
         .env("CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING", "1")
         .env_remove("APOLLOCLAW_SWITCH_DATEI")
         .env("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION", "true")
@@ -901,6 +948,8 @@ impl App {
             w0: 0.0,
             cmds: vec![],
             cms: vec![],
+            #[cfg(unix)]
+            cs: None,
         });
         a.ctrl("init", init());
         let ar = a.lv.as_ref().map(|l| l.args.clone()).unwrap_or_default();
@@ -960,6 +1009,15 @@ impl App {
             "talk on the phone, the text lands in this input (off to stop)".into(),
         ));
         v.push(("noname".into(), "noname settings".into()));
+        if cfg!(unix) && self.lv.is_some() {
+            v.push((
+                "codemode".into(),
+                format!(
+                    "Claude Code Code Mode for this session, now {}",
+                    if codemode() { "on" } else { "off" }
+                ),
+            ));
+        }
         v.push((
             "default-permission".into(),
             "permission mode new sessions start in".into(),
@@ -1016,6 +1074,11 @@ impl App {
                 .lv
                 .as_ref()
                 .is_some_and(|l| l.cmds.iter().any(|c| c.0 == "apolloclaw:switch"))
+    }
+
+    /// Whether messages go to a Claude Code session with Code Mode on.
+    pub fn code_on(&self) -> bool {
+        self.lv.is_some() && codemode()
     }
 
     /// Whether the Claude engine is the one in use.
@@ -1080,6 +1143,11 @@ impl App {
     }
 
     pub(crate) fn lsubmit(&mut self, s: String) {
+        #[cfg(unix)]
+        if codemode() {
+            self.kmsubmit(s);
+            return;
+        }
         if !self.revive() {
             return;
         }
@@ -1109,6 +1177,8 @@ impl App {
         let (c, arg) = r.split_once(' ').unwrap_or((r, ""));
         match c {
             "btw" if !arg.trim().is_empty() => self.lbtw(arg.trim()),
+            #[cfg(unix)]
+            "codemode" => self.lcode(arg),
             "clear" | "new" => {
                 let args: Vec<String> =
                     self.lv.as_ref().map(|l| fresh(&l.args)).unwrap_or_default();
@@ -1445,6 +1515,11 @@ impl App {
     }
 
     pub(crate) fn lstop(&mut self) {
+        #[cfg(unix)]
+        if let Some(c) = self.lv.as_mut().and_then(|l| l.cs.as_mut()) {
+            c.int();
+            self.busy = false;
+        }
         self.ctrl("int", json!({"subtype": "interrupt"}));
         self.ldeny("The user interrupted.");
         if self.ask.is_some() {
@@ -1584,6 +1659,131 @@ impl App {
             self.bev(e);
         }
         self.cmpoll();
+        #[cfg(unix)]
+        self.cspoll();
+    }
+
+    #[cfg(unix)]
+    fn kmsubmit(&mut self, s: String) {
+        if let Some(c) = self.lv.as_mut().and_then(|l| l.cs.as_mut())
+            && c.ask
+        {
+            c.key(&s);
+            self.bs.push(B::Sys(format!("answered  {}", s.trim())));
+            return;
+        }
+        if !self.busy {
+            self.t0 = self.t;
+        }
+        self.bs.push(B::U(s.clone(), self.clock()));
+        let w = self.d7;
+        let txt = self.expand(&s);
+        let mode = PM[self.mode];
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let n = self.bs.len();
+        let Some(l) = &mut self.lv else { return };
+        l.tb = n;
+        l.w0 = w;
+        if let Some(c) = &mut l.cs {
+            c.send(&txt);
+            self.busy = true;
+            self.sb = None;
+            return;
+        }
+        let mut f: Vec<String> = vec!["--permission-mode".into(), mode.into()];
+        for k in ["--model", "--effort"] {
+            if let Some(v) = fval(&l.args, &[k]).filter(|v| !v.is_empty()) {
+                f.extend([k.into(), v]);
+            }
+        }
+        let old = Some(l.sid.clone()).filter(|x| {
+            !x.is_empty() && std::path::Path::new(&format!("{}/{x}.jsonl", pdir(&cwd))).exists()
+        });
+        match crate::cm::Sess::start(old.as_deref(), &f, &cwd, &txt) {
+            Ok(c) => {
+                l.sid = c.id.clone();
+                l.cs = Some(c);
+                self.busy = true;
+                self.sb = None;
+            }
+            Err(e) => {
+                self.bs
+                    .push(B::Sys(format!("code mode could not start: {e}")));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn cspoll(&mut self) {
+        let evs = match self.lv.as_mut().and_then(|l| l.cs.as_mut()) {
+            Some(c) => c.poll(),
+            None => return,
+        };
+        for e in evs {
+            match e {
+                crate::cm::Se::Ev(v) => {
+                    if v["type"] == "assistant" {
+                        for c in v["message"]["content"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default()
+                        {
+                            match c["type"].as_str().unwrap_or("") {
+                                "text" if !sv(&c, "text").trim().is_empty() => {
+                                    self.bs.push(B::T(sv(&c, "text")))
+                                }
+                                "thinking" if !sv(&c, "thinking").trim().is_empty() => {
+                                    self.bs.push(B::Th(sv(&c, "thinking")))
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    self.ev(v);
+                }
+                crate::cm::Se::Done => self.ev(json!({"type": "result", "result": ""})),
+                crate::cm::Se::Ask(t) => self.bs.push(B::Sys(format!(
+                    "code mode is asking for permission, answer with the option number or n:\n{t}"
+                ))),
+                crate::cm::Se::Fail(m) => {
+                    if let Some(l) = &mut self.lv {
+                        l.cs = None;
+                    }
+                    self.busy = false;
+                    self.sb = None;
+                    self.bs.push(B::Sys(m));
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn lcode(&mut self, arg: &str) {
+        let on = match arg.trim() {
+            "on" => true,
+            "off" => false,
+            _ => !codemode(),
+        };
+        setcodemode(on);
+        if !on {
+            let c = self.lv.as_mut().and_then(|l| l.cs.take());
+            if let Some(c) = c {
+                let id = c.id.clone();
+                let used = c.turns > 0 || c.busy;
+                drop(c);
+                self.busy = false;
+                if used {
+                    self.lresume(&id);
+                }
+            }
+        }
+        self.toast(if on {
+            "code mode  on"
+        } else {
+            "code mode  off"
+        });
     }
 
     fn creq(&mut self, e: &Value) {
@@ -2786,6 +2986,8 @@ impl App {
             w0: -1.0,
             cmds,
             cms: vec![],
+            #[cfg(unix)]
+            cs: None,
         });
         self.bs.truncate(i);
         self.ask = None;
@@ -3161,6 +3363,8 @@ mod queue_tests {
             w0: 0.0,
             cmds: vec![],
             cms: vec![],
+            #[cfg(unix)]
+            cs: None,
         });
         (a, cat)
     }

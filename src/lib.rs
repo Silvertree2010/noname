@@ -1721,6 +1721,10 @@ impl App {
             ),
             ("move folder", sweep::folder()),
             (
+                "code mode at start",
+                if live::defcode() { "on" } else { "off" }.into(),
+            ),
+            (
                 "check for updates",
                 if self.ups.is_empty() {
                     format!("{}  {}", upd::short(), upd::DATE)
@@ -3096,6 +3100,15 @@ impl App {
                             if on { "on" } else { "off" }
                         ));
                     }
+                    20 => {
+                        let on = !live::defcode();
+                        live::setdefcode(on);
+                        live::setcodemode(on);
+                        self.toast(format!(
+                            "code mode at start  {}",
+                            if on { "on" } else { "off" }
+                        ));
+                    }
                     _ => self.upcheck(true),
                 },
                 _ => {}
@@ -4334,9 +4347,17 @@ fn lp<T: V>(term: &mut Terminal<CrosstermBackend<io::Stdout>>, v: &mut T) -> io:
         || ag
         || args.iter().any(|x| x == "--codex")
         || std::env::var("NONAME_ENGINE").is_ok_and(|x| x == "codex");
+    if args.iter().any(|x| x == "--codemode" || x == "--code-mode") {
+        live::setcodemode(true);
+    }
     let args: Vec<String> = args
         .into_iter()
-        .filter(|x| x != "--codex" && x != "--opencode" && x != "--agy" && x != "--antigravity")
+        .filter(|x| {
+            !matches!(
+                x.as_str(),
+                "--codex" | "--opencode" | "--agy" | "--antigravity" | "--codemode" | "--code-mode"
+            )
+        })
         .collect();
     let mut a = if std::env::var("NONAME_MOCK").is_ok() {
         App::new()

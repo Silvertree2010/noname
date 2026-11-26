@@ -2317,6 +2317,9 @@ impl V for V1 {
         } else {
             vec![]
         };
+        if a.code_on() {
+            model.push(Span::styled("code mode  ", st(L2()).bold()));
+        }
         model.extend(decode(
             &a.mname.replace(' ', "-"),
             a.t / 2,

@@ -102,6 +102,91 @@ fn act(name: &str, i: &Value) -> String {
     }
 }
 
+#[cfg(unix)]
+type Pty = (
+    std::process::Child,
+    std::os::fd::OwnedFd,
+    std::sync::Arc<std::sync::Mutex<vt100::Parser>>,
+);
+
+#[cfg(unix)]
+fn pty(args: &[String], cwd: &str, sig: &std::path::Path) -> io::Result<Pty> {
+    use std::fs::File;
+    use std::io::Read;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
+
+    let hk = format!("touch '{}'", sig.to_string_lossy().replace('\'', "'\\''"));
+    let st = json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": hk}]}]}});
+    let (rows, cols) = (50u16, 200u16);
+    let (mut m, mut s) = (0, 0);
+    let w = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    if unsafe {
+        libc::openpty(
+            &mut m,
+            &mut s,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &w as *const _ as *mut _,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let m = unsafe { OwnedFd::from_raw_fd(m) };
+    let s = unsafe { OwnedFd::from_raw_fd(s) };
+    let mut c = Command::new(crate::sys::bin("claude"));
+    for k in STRIP {
+        c.env_remove(k);
+    }
+    crate::live::tokenv_pub(&mut c);
+    c.arg("--settings")
+        .arg(st.to_string())
+        .args(args)
+        .current_dir(cwd)
+        .env("CLAUDE_CODE_EXPERIMENTAL_CODE_MODE", "1")
+        .env("TERM", "xterm-256color")
+        .env("COLUMNS", cols.to_string())
+        .env("LINES", rows.to_string())
+        .stdin(Stdio::from(s.try_clone()?))
+        .stdout(Stdio::from(s.try_clone()?))
+        .stderr(Stdio::from(s.try_clone()?));
+    unsafe {
+        c.pre_exec(|| {
+            libc::setsid();
+            libc::ioctl(0, libc::TIOCSCTTY as _, 0);
+            #[cfg(target_os = "linux")]
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            Ok(())
+        });
+    }
+    let ch = c.spawn()?;
+    drop(s);
+    crate::live::track_pid(ch.id() as i32);
+    let ps = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+    let p2 = ps.clone();
+    let mut f = File::from(m.try_clone()?);
+    std::thread::spawn(move || {
+        let mut b = [0u8; 16384];
+        while let Ok(n) = f.read(&mut b) {
+            if n == 0 {
+                break;
+            }
+            if let Ok(mut p) = p2.lock() {
+                p.process(&b[..n]);
+            }
+        }
+    });
+    Ok((ch, m, ps))
+}
+
 pub(crate) struct Run {
     #[cfg(unix)]
     ch: std::process::Child,
@@ -137,9 +222,11 @@ fn dialog(sc: &str) -> Option<u8> {
         .filter(|l| !l.is_empty())
         .collect();
     let b = &v[v.len().saturating_sub(16)..];
+    let esc = b.iter().any(|l| l.contains("Esc to cancel"));
     let menu = b.iter().any(|l| {
         l.strip_prefix('❯').map(str::trim_start).is_some_and(|r| {
-            r.chars().next().is_some_and(|c| c.is_ascii_digit()) && r.contains(". ")
+            (r.chars().next().is_some_and(|c| c.is_ascii_digit()) && r.contains(". "))
+                || (esc && !r.is_empty())
         })
     });
     if !menu {
@@ -180,92 +267,22 @@ impl Run {
 
     #[cfg(unix)]
     pub(crate) fn start(task: &str, model: Option<&str>, mode: &str, cwd: &str) -> io::Result<Run> {
-        use std::fs::File;
-        use std::io::Read;
-        use std::os::fd::{FromRawFd, OwnedFd};
-        use std::os::unix::process::CommandExt;
-        use std::process::{Command, Stdio};
-        use std::sync::{Arc, Mutex};
-
         let id = uuid();
         let dir =
             std::env::temp_dir().join(format!("noname-cm-{}-{}", std::process::id(), &id[..8]));
         std::fs::create_dir_all(&dir)?;
         let sig = dir.join("stop");
-        let hk = format!("touch '{}'", sig.to_string_lossy().replace('\'', "'\\''"));
-        let st = json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": hk}]}]}});
-        let (rows, cols) = (50u16, 200u16);
-        let (mut m, mut s) = (0, 0);
-        let w = libc::winsize {
-            ws_row: rows,
-            ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        if unsafe {
-            libc::openpty(
-                &mut m,
-                &mut s,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &w as *const _ as *mut _,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let m = unsafe { OwnedFd::from_raw_fd(m) };
-        let s = unsafe { OwnedFd::from_raw_fd(s) };
-        let mut c = Command::new(crate::sys::bin("claude"));
-        for k in STRIP {
-            c.env_remove(k);
-        }
-        crate::live::tokenv_pub(&mut c);
-        c.arg("--session-id")
-            .arg(&id)
-            .arg("--settings")
-            .arg(st.to_string())
-            .arg("--permission-mode")
-            .arg(mode);
+        let mut a: Vec<String> = vec![
+            "--session-id".into(),
+            id.clone(),
+            "--permission-mode".into(),
+            mode.into(),
+        ];
         if let Some(md) = model.filter(|x| !x.trim().is_empty()) {
-            c.arg("--model").arg(md.trim());
+            a.extend(["--model".into(), md.trim().into()]);
         }
-        c.arg("--")
-            .arg(task)
-            .current_dir(cwd)
-            .env("CLAUDE_CODE_EXPERIMENTAL_CODE_MODE", "1")
-            .env("TERM", "xterm-256color")
-            .env("COLUMNS", cols.to_string())
-            .env("LINES", rows.to_string())
-            .stdin(Stdio::from(s.try_clone()?))
-            .stdout(Stdio::from(s.try_clone()?))
-            .stderr(Stdio::from(s.try_clone()?));
-        unsafe {
-            c.pre_exec(|| {
-                libc::setsid();
-                libc::ioctl(0, libc::TIOCSCTTY as _, 0);
-                #[cfg(target_os = "linux")]
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-                Ok(())
-            });
-        }
-        let ch = c.spawn()?;
-        drop(s);
-        crate::live::track_pid(ch.id() as i32);
-        let ps = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
-        let p2 = ps.clone();
-        let mut f = File::from(m.try_clone()?);
-        std::thread::spawn(move || {
-            let mut b = [0u8; 16384];
-            while let Ok(n) = f.read(&mut b) {
-                if n == 0 {
-                    break;
-                }
-                if let Ok(mut p) = p2.lock() {
-                    p.process(&b[..n]);
-                }
-            }
-        });
+        a.extend(["--".into(), task.into()]);
+        let (ch, m, ps) = pty(&a, cwd, &sig)?;
         let tr = PathBuf::from(format!("{}/{id}.jsonl", crate::live::pdir_pub(cwd)));
         Ok(Run {
             ch,
@@ -454,6 +471,253 @@ impl Run {
     }
 }
 
+pub(crate) enum Se {
+    Ev(Value),
+    Done,
+    Ask(String),
+    Fail(String),
+}
+
+#[cfg(unix)]
+pub(crate) struct Sess {
+    ch: std::process::Child,
+    w: std::fs::File,
+    _m: std::os::fd::OwnedFd,
+    ps: std::sync::Arc<std::sync::Mutex<vt100::Parser>>,
+    dir: PathBuf,
+    sig: PathBuf,
+    tr: PathBuf,
+    pos: u64,
+    part: Vec<u8>,
+    pub(crate) id: String,
+    pub(crate) busy: bool,
+    pub(crate) ask: bool,
+    pub(crate) turns: u32,
+    lp: Instant,
+    sd: Option<Instant>,
+    dlg: Option<(u8, Instant)>,
+    dead: bool,
+}
+
+#[cfg(unix)]
+impl Sess {
+    pub(crate) fn start(
+        resume: Option<&str>,
+        flags: &[String],
+        cwd: &str,
+        first: &str,
+    ) -> io::Result<Sess> {
+        let id = resume.map(str::to_string).unwrap_or_else(uuid);
+        let dir =
+            std::env::temp_dir().join(format!("noname-cs-{}-{}", std::process::id(), &id[..8]));
+        std::fs::create_dir_all(&dir)?;
+        let sig = dir.join("stop");
+        let _ = std::fs::remove_file(&sig);
+        let mut a: Vec<String> = vec![
+            if resume.is_some() {
+                "--resume"
+            } else {
+                "--session-id"
+            }
+            .into(),
+            id.clone(),
+        ];
+        a.extend(flags.iter().cloned());
+        a.extend(["--".into(), first.into()]);
+        let tr = PathBuf::from(format!("{}/{id}.jsonl", crate::live::pdir_pub(cwd)));
+        let pos = std::fs::metadata(&tr).map(|m| m.len()).unwrap_or(0);
+        let (ch, m, ps) = pty(&a, cwd, &sig)?;
+        let w = std::fs::File::from(m.try_clone()?);
+        Ok(Sess {
+            ch,
+            w,
+            _m: m,
+            ps,
+            dir,
+            sig,
+            tr,
+            pos,
+            part: vec![],
+            id,
+            busy: true,
+            ask: false,
+            turns: 0,
+            lp: Instant::now(),
+            sd: None,
+            dlg: None,
+            dead: false,
+        })
+    }
+
+    fn put(&mut self, b: &[u8]) {
+        use std::io::Write;
+        let _ = self.w.write_all(b);
+        let _ = self.w.flush();
+    }
+
+    pub(crate) fn send(&mut self, t: &str) {
+        let _ = std::fs::remove_file(&self.sig);
+        self.sd = None;
+        self.busy = true;
+        let t = t.replace("\x1b[201~", "");
+        self.put(format!("\x1b[200~{t}\x1b[201~").as_bytes());
+        if let Ok(mut w) = self.w.try_clone() {
+            std::thread::spawn(move || {
+                use std::io::Write;
+                std::thread::sleep(Duration::from_millis(250));
+                let _ = w.write_all(b"\r");
+                let _ = w.flush();
+            });
+        }
+    }
+
+    pub(crate) fn key(&mut self, t: &str) {
+        let t = t.trim();
+        let k = match t.to_lowercase().as_str() {
+            "n" | "no" | "esc" => "\x1b".to_string(),
+            "y" | "yes" => "1".to_string(),
+            _ => t.chars().take(1).collect(),
+        };
+        self.ask = false;
+        self.dlg = None;
+        self.put(k.as_bytes());
+    }
+
+    pub(crate) fn int(&mut self) {
+        self.put(b"\x1b");
+        self.busy = false;
+        self.ask = false;
+    }
+
+    fn screen(&self) -> String {
+        self.ps
+            .lock()
+            .map(|p| p.screen().contents())
+            .unwrap_or_default()
+    }
+
+    fn tail(&self, n: usize) -> String {
+        let s = self.screen();
+        let v: Vec<&str> = s
+            .lines()
+            .map(str::trim_end)
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        v[v.len().saturating_sub(n)..].join("\n")
+    }
+
+    fn read(&mut self, out: &mut Vec<Se>) {
+        use std::io::{Read, Seek, SeekFrom};
+        let Ok(mut f) = std::fs::File::open(&self.tr) else {
+            return;
+        };
+        let n = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if n <= self.pos || f.seek(SeekFrom::Start(self.pos)).is_err() {
+            return;
+        }
+        let mut b = vec![];
+        let Ok(k) = f.take(n - self.pos).read_to_end(&mut b) else {
+            return;
+        };
+        self.pos += k as u64;
+        self.part.extend_from_slice(&b);
+        for l in lines(&mut self.part) {
+            let Ok(mut v) = serde_json::from_str::<Value>(&l) else {
+                continue;
+            };
+            if v["isSidechain"] == true || v["isMeta"] == true {
+                continue;
+            }
+            match v["type"].as_str().unwrap_or("") {
+                "assistant" => out.push(Se::Ev(v)),
+                "user" => {
+                    let tr = v["message"]["content"]
+                        .as_array()
+                        .is_some_and(|a| a.iter().any(|c| c["type"] == "tool_result"));
+                    if tr {
+                        if let Some(r) = v.get("toolUseResult").cloned() {
+                            v["tool_use_result"] = r;
+                        }
+                        out.push(Se::Ev(v));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub(crate) fn poll(&mut self) -> Vec<Se> {
+        let mut out = vec![];
+        if self.dead || self.lp.elapsed().as_millis() < 150 {
+            return out;
+        }
+        self.lp = Instant::now();
+        let stop = self.sig.exists();
+        self.read(&mut out);
+        if stop && self.busy {
+            let sd = *self.sd.get_or_insert_with(Instant::now);
+            if sd.elapsed().as_millis() >= 400 {
+                self.read(&mut out);
+                let _ = std::fs::remove_file(&self.sig);
+                self.sd = None;
+                self.busy = false;
+                self.ask = false;
+                self.turns += 1;
+                out.push(Se::Done);
+            }
+            return out;
+        }
+        if stop && !self.busy {
+            let _ = std::fs::remove_file(&self.sig);
+        }
+        let sc = self.screen();
+        let d = dialog(&sc);
+        let held = match (d, self.dlg) {
+            (Some(k), Some((j, t))) if k == j => t.elapsed() >= HOLD,
+            (Some(k), _) => {
+                self.dlg = Some((k, Instant::now()));
+                false
+            }
+            (None, _) => {
+                self.dlg = None;
+                self.ask = false;
+                false
+            }
+        };
+        let fail = match d {
+            Some(0) if held => Some(
+                "Code Mode is not confirmed yet. Run `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1 claude` once in a terminal and choose \"Yes, turn on Code Mode\".".to_string(),
+            ),
+            Some(1) if held => Some(
+                "This folder is not trusted for interactive Claude Code yet. Run `claude` here once and trust the folder.".to_string(),
+            ),
+            Some(_) if held && !self.ask => {
+                self.ask = true;
+                out.push(Se::Ask(self.tail(14)));
+                None
+            }
+            _ if crate::live::exited(&mut self.ch) => {
+                Some(format!("The code mode session exited.\n\n{}", self.tail(12)))
+            }
+            _ => None,
+        };
+        if let Some(m) = fail {
+            self.dead = true;
+            self.busy = false;
+            out.push(Se::Fail(m));
+        }
+        out
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Sess {
+    fn drop(&mut self) {
+        crate::live::reap_pub(&mut self.ch);
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 impl Drop for Run {
     fn drop(&mut self) {
         #[cfg(unix)]
@@ -476,6 +740,10 @@ mod tests {
         assert_eq!(dialog(p), Some(2));
         let t = "Quick safety check\n❯ 1. Yes, I trust this folder\n  2. No, exit";
         assert_eq!(dialog(t), Some(1));
+        let n = "Quick safety check: Is this a project you trust?\n ❯ No, exit\n   Yes, I trust this folder\n Enter to confirm · Esc to cancel";
+        assert_eq!(dialog(n), Some(1));
+        let i = "> trust this folder\n❯ say hi\n? for shortcuts";
+        assert_eq!(dialog(i), None);
         let c = "Code Mode\n❯ 1. Yes, turn on Code Mode\n  2. No";
         assert_eq!(dialog(c), Some(0));
         let old = format!("Do you want to proceed?\n{}❯ 1. Yes", "line\n".repeat(30));
