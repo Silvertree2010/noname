@@ -11,6 +11,7 @@ pub mod free;
 pub mod img;
 mod live;
 mod opencode;
+mod proj;
 pub mod sweep;
 pub mod sys;
 pub mod upd;
@@ -713,6 +714,8 @@ pub struct App {
     pub hooks: Vec<(String, String, u64)>,
     /// Session title.
     pub stitle: String,
+    /// Project this chat works on (named in the first prompt or set with `/project`), shown in the window title.
+    pub proj: String,
     /// Models offered by the engine.
     pub models: Vec<ModelEntry>,
     /// Clickable regions of the last frame as (row, first column, end column, target), where the target is a URL or a file path.
@@ -1053,6 +1056,7 @@ impl App {
             retry: None,
             hooks: vec![],
             stitle: String::new(),
+            proj: String::new(),
             models: MID_ALL
                 .iter()
                 .map(|(v, d)| {
@@ -1105,6 +1109,53 @@ impl App {
     /// Index in `bs` of the block that is currently being streamed, if any.
     pub fn streaming(&self) -> Option<usize> {
         self.sb
+    }
+
+    /// Sets the project of this chat, saves it for the session and warns when another
+    /// noname window already works on it.
+    pub fn setproj(&mut self, p: &str) {
+        self.proj = p.to_string();
+        proj::announce(p);
+        proj::save_session(&self.session_id(), p);
+        let n = proj::others(p);
+        if n > 0 {
+            self.bs.push(B::Sys(format!(
+                "{p} is already open in {} other noname window{}",
+                n,
+                if n == 1 { "" } else { "s" }
+            )));
+        }
+    }
+
+    /// `/project`: shows the project, `/project NAME` sets it (a new name is added to the
+    /// known projects), `/project off` clears it.
+    fn projcmd(&mut self, a: &str) {
+        if a.is_empty() {
+            let ps: Vec<String> = proj::list().into_iter().map(|e| e.0).collect();
+            let cur = if self.proj.is_empty() {
+                "none"
+            } else {
+                &self.proj
+            };
+            self.bs.push(B::Sys(format!(
+                "project  {cur}  ·  known: {}  ·  /project NAME sets it, /project off clears it  ·  list in {}",
+                if ps.is_empty() { "none".into() } else { ps.join(", ") },
+                proj::file()
+            )));
+        } else if a == "off" || a == "-" {
+            self.proj.clear();
+            proj::announce("");
+            proj::save_session(&self.session_id(), "");
+            self.toast("project  off");
+        } else {
+            let (p, new) = proj::learn(a);
+            self.setproj(&p);
+            self.toast(if new {
+                format!("project  {p}  (new, added to the list)")
+            } else {
+                format!("project  {p}")
+            });
+        }
     }
 
     /// Shows `s` in the footer for about two seconds.
@@ -1360,6 +1411,12 @@ impl App {
         self.hist.push(s.clone());
         self.hi = None;
         self.drf = None;
+        if self.proj.is_empty()
+            && !s.starts_with("/project")
+            && let Some(p) = proj::find(&s).or_else(|| proj::find(&self.cwd))
+        {
+            self.setproj(&p);
+        }
         if let Some(k) = bg::canon(&s) {
             self.setbg(Some(k));
             return;
@@ -1751,6 +1808,10 @@ impl App {
         let (c0, a0) = r.split_once(' ').unwrap_or((r, ""));
         if c0 == "noname" {
             self.ns = Some(0);
+            return;
+        }
+        if c0 == "project" {
+            self.projcmd(a0.trim());
             return;
         }
         if (c0 == "model" || c0 == "effort")
@@ -4993,10 +5054,11 @@ pub fn bgfile() -> String {
 }
 
 fn ttl(a: &App) -> String {
-    let d = if a.stitle.is_empty() {
-        a.cwd.rsplit('/').next().unwrap_or("").to_string()
-    } else {
-        a.stitle.clone()
+    let d = match (a.proj.is_empty(), a.stitle.is_empty()) {
+        (true, true) => a.cwd.rsplit('/').next().unwrap_or("").to_string(),
+        (true, false) => a.stitle.clone(),
+        (false, true) => a.proj.clone(),
+        (false, false) => format!("{} · {}", a.proj, a.stitle),
     };
     let st = if a.ask.is_some() || a.qa.is_some() {
         "? "
