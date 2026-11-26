@@ -917,6 +917,9 @@ impl App {
                 l.sid = id.clone();
             }
             a.load(&id, &cwd);
+            if let Some(p) = crate::proj::of_session(&id) {
+                a.setproj(&p);
+            }
         }
         a.ctrl("use", json!({"subtype": "get_usage"}));
         a.ctrl("ctx", json!({"subtype": "get_context_usage"}));
@@ -981,12 +984,13 @@ impl App {
             ("mcp", "mcp servers: reconnect, enable or disable"),
             ("diff", "all changes in this workspace"),
             ("rename", "name this session"),
+            ("project", "project of this chat, shown in the window title"),
             (
                 "clear-folder",
                 "folder that /clear moves session files to (see /noname)",
             ),
         ] {
-            if self.lv.is_some() || matches!(c, "model" | "effort" | "tasks") {
+            if self.lv.is_some() || matches!(c, "model" | "effort" | "tasks" | "project") {
                 v.retain(|x| x.0 != c);
                 v.push((c.into(), d.into()));
             }
@@ -1346,6 +1350,10 @@ impl App {
             if !br.is_empty() {
                 meta += &format!("  ·  {br}");
             }
+            let title = match crate::proj::of_session(&id) {
+                Some(p) => format!("[{p}] {title}"),
+                None => title,
+            };
             v.push((m, id, one(&title, 120), meta));
         }
         v.sort_by_key(|a| std::cmp::Reverse(a.0));
@@ -1954,6 +1962,9 @@ impl App {
                         .unwrap_or_default();
                     if let Some(l) = &mut self.lv {
                         l.sid = sid.clone();
+                    }
+                    if !self.proj.is_empty() {
+                        crate::proj::save_session(&sid, &self.proj);
                     }
                     if rs && !sid.is_empty() && ld != sid {
                         let ok =
